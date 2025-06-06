@@ -64,7 +64,7 @@ def train_step(model: NMF, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, X
     metrics.update(neg_logprob=loss)
     optimizer.update(grads)
 
-def nmf(adata: AnnData, k: int = 64, batch_size: int = 2048, hidden_dim=128, lr=1e-3, max_epochs: int = 200, patience: int = 10, min_delta: float = 1e-4):
+def nmf(adata: AnnData, k: int = 64, batch_size: int = 2048, hidden_dim=128, lr=1e-3, max_epochs: int = 500, patience: int = 10, min_delta: float = 1e-4):
     m, n = adata.shape
 
     # X = np.asarray(adata.X.todense(), dtype=np.float32)
@@ -113,4 +113,20 @@ def nmf(adata: AnnData, k: int = 64, batch_size: int = 2048, hidden_dim=128, lr=
                 pbar.write(f"Early stopping at epoch {epoch + 1}: no improvement for {patience} epochs")
                 break
 
-    # TODO: map adata.X through encoder in chunks and store in data.obsm["Xnmf"]
+    # Map entire X matrix through encoder in chunks
+    Xnmf = np.zeros((m, k), dtype=np.float32)
+    for start_idx in range(0, m, batch_size):
+        end_idx = min(start_idx + batch_size, m)
+
+        # Extract chunk from sparse matrix
+        X_chunk = X[start_idx:end_idx, :].todense()
+        X_chunk = jnp.array(X_chunk, dtype=jnp.float32)
+
+        # Encode chunk
+        encoded_chunk = model.encoder(X_chunk)
+
+        # Store in output array
+        Xnmf[start_idx:end_idx, :] = np.array(encoded_chunk)
+
+    # Store in AnnData object
+    adata.obsm["X_nmf"] = Xnmf
