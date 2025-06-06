@@ -8,6 +8,13 @@ import numpy as np
 import optax
 from tqdm import tqdm
 
+def as_dense_f32(X: csr_matrix | np.ndarray) -> np.ndarray:
+    if isinstance(X, csr_matrix):
+        return X.todense().astype(np.float32)
+    else:
+        return X.astype(np.float32)
+
+
 class CSRMatrixRowSampler:
     def __init__(self, X: csr_matrix, batch_size: int):
         m, n = X.shape
@@ -26,6 +33,24 @@ class CSRMatrixRowSampler:
             self.X[self.idx[fr:to], :].todense(out=self.chunk)
             yield jnp.array(self.chunk)
 
+class DenseMatrixRowSampler:
+    def __init__(self, X: np.ndarray, batch_size: int):
+        m, n = X.shape
+        self.X = X
+        self.idx = np.arange(m)
+        self.chunk = np.zeros((batch_size, n), dtype=np.float32)
+        self.batch_size = batch_size
+        self.m = m
+
+    def __iter__(self):
+        np.random.shuffle(self.idx)
+        for fr in range(0, len(self.idx), self.batch_size):
+            to = fr + self.batch_size
+            if to >= self.m:
+                break
+            self.chunk[:] = self.X[self.idx[fr:to], :]
+            yield jnp.array(self.chunk)
+
 class Encoder(nnx.Module):
     def __init__(self, n: int, k: int, batch_size: int, hidden_dim: int, *, rngs: nnx.Rngs):
         self.lyr1 = nnx.Linear(n, hidden_dim, rngs=rngs)
@@ -38,7 +63,7 @@ class Encoder(nnx.Module):
         u = self.lyr2(u)
         u = nnx.relu(u)
         u = self.lyr3(u)
-        return jnp.exp(u)
+        return nnx.softplus(u)
 
 class NMF(nnx.Module):
     def __init__(self, n:int, k: int, batch_size: int, hidden_dim: int, *, rngs: nnx.Rngs):
@@ -64,12 +89,11 @@ def train_step(model: NMF, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, X
     metrics.update(neg_logprob=loss)
     optimizer.update(grads)
 
-def nmf(adata: AnnData, k: int = 64, batch_size: int = 2048, hidden_dim=128, lr=1e-3, max_epochs: int = 500, patience: int = 10, min_delta: float = 1e-4):
+def nmf(adata: AnnData, k: int = 64, batch_size: int | None = 2048, hidden_dim=256, lr=1e-2, max_epochs: int = 500, patience: int = 20, min_delta: float = 1e-4):
     m, n = adata.shape
 
-    # X = np.asarray(adata.X.todense(), dtype=np.float32)
-    # X = jnp.array(X)
-    X = adata.X.astype(np.float32)
+    if batch_size is None:
+        batch_size = m
 
     rngs = nnx.Rngs(0)
     model = NMF(n, k, batch_size, hidden_dim, rngs=rngs)
@@ -79,7 +103,17 @@ def nmf(adata: AnnData, k: int = 64, batch_size: int = 2048, hidden_dim=128, lr=
         neg_logprob=nnx.metrics.Average("neg_logprob")
     )
 
-    batch_sampler = CSRMatrixRowSampler(X, batch_size)
+    X = adata.X
+
+    if batch_size == m:
+        batch_sampler = [jnp.array(as_dense_f32(X))]
+    else:
+        if isinstance(X, csr_matrix):
+            batch_sampler = CSRMatrixRowSampler(X, batch_size)
+        elif isinstance(X, np.ndarray):
+            batch_sampler = DenseMatrixRowSampler(X, batch_size)
+        else:
+            raise ValueError(f"Unsupported data type: {type(X)}")
 
     # Convergence tracking
     best_logprob = -float('inf')
@@ -118,14 +152,10 @@ def nmf(adata: AnnData, k: int = 64, batch_size: int = 2048, hidden_dim=128, lr=
     for start_idx in range(0, m, batch_size):
         end_idx = min(start_idx + batch_size, m)
 
-        # Extract chunk from sparse matrix
-        X_chunk = X[start_idx:end_idx, :].todense()
+        X_chunk = as_dense_f32(X[start_idx:end_idx, :])
         X_chunk = jnp.array(X_chunk, dtype=jnp.float32)
-
-        # Encode chunk
         encoded_chunk = model.encoder(X_chunk)
 
-        # Store in output array
         Xnmf[start_idx:end_idx, :] = np.array(encoded_chunk)
 
     # Store in AnnData object
