@@ -90,6 +90,71 @@ def train_step(model: NMF, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, X
     optimizer.update(grads)
 
 def nmf(adata: AnnData, k: int = 64, batch_size: int | None = 4096, hidden_dim=256, lr=5e-3, max_epochs: int = 2000, patience: int = 40, min_delta: float = 1e-4):
+    """
+    Perform Non-negative Matrix Factorization (NMF) on genomic count data.
+    
+    This function applies a neural network-based NMF to decompose the count matrix 
+    stored in an AnnData object into lower-dimensional representations. The method
+    uses an encoder-decoder architecture with early stopping for convergence.
+    
+    Parameters
+    ----------
+    adata : AnnData
+        Annotated data object containing the count matrix in adata.X.
+        The matrix should have shape (n_observations, n_features).
+    k : int, default=64
+        Number of latent factors/components for the NMF decomposition.
+        This determines the dimensionality of the reduced representation.
+    batch_size : int or None, default=4096
+        Size of batches for mini-batch training. If None, uses the full
+        dataset (batch_size = n_observations) for training.
+    hidden_dim : int, default=256
+        Number of hidden units in the encoder neural network.
+    lr : float, default=5e-3
+        Learning rate for the Adam optimizer.
+    max_epochs : int, default=2000
+        Maximum number of training epochs.
+    patience : int, default=40
+        Number of epochs to wait for improvement before early stopping.
+    min_delta : float, default=1e-4
+        Minimum change in log-probability to be considered an improvement
+        for early stopping.
+    
+    Returns
+    -------
+    None
+        The function modifies the input AnnData object in-place.
+    
+    Notes
+    -----
+    Results are stored in the AnnData object as:
+    
+    - `adata.obsm["X_nmf"]` : ndarray of shape (n_observations, k)
+        The low-dimensional NMF representation of the observations.
+        Each row corresponds to an observation (cell) and each column
+        to a latent factor.
+    
+    The method supports both sparse (CSR) and dense numpy arrays as input
+    and automatically handles batching for memory efficiency with large datasets.
+    Training uses early stopping based on log-probability improvement to
+    prevent overfitting.
+    
+    Examples
+    --------
+    >>> import anndata as ad
+    >>> import numpy as np
+    >>> from countdown import nmf
+    >>> 
+    >>> # Create example count data
+    >>> X = np.random.poisson(5, size=(1000, 2000))
+    >>> adata = ad.AnnData(X)
+    >>> 
+    >>> # Apply NMF with 32 components
+    >>> nmf(adata, k=32)
+    >>> 
+    >>> # Access the results
+    >>> print(adata.obsm["X_nmf"].shape)  # (1000, 32)
+    """
     m, n = adata.shape
 
     if batch_size is None:
