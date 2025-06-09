@@ -18,7 +18,7 @@ def as_dense_f32(X: csr_matrix | np.ndarray) -> np.ndarray:
 class CSRMatrixRowSampler:
     def __init__(self, X: csr_matrix, batch_size: int):
         m, n = X.shape
-        self.X = X
+        self.X = X.astype(np.float32)
         self.idx = np.arange(m)
         self.chunk = np.zeros((batch_size, n), dtype=np.float32)
         self.batch_size = batch_size
@@ -92,11 +92,11 @@ def train_step(model: NMF, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, X
 def nmf(adata: AnnData, k: int = 64, batch_size: int | None = 4096, hidden_dim=256, lr=5e-3, max_epochs: int = 2000, patience: int = 40, min_delta: float = 1e-4):
     """
     Perform Non-negative Matrix Factorization (NMF) on genomic count data.
-    
-    This function applies a neural network-based NMF to decompose the count matrix 
+
+    This function applies a neural network-based NMF to decompose the count matrix
     stored in an AnnData object into lower-dimensional representations. The method
     uses an encoder-decoder architecture with early stopping for convergence.
-    
+
     Parameters
     ----------
     adata : AnnData
@@ -119,39 +119,39 @@ def nmf(adata: AnnData, k: int = 64, batch_size: int | None = 4096, hidden_dim=2
     min_delta : float, default=1e-4
         Minimum change in log-probability to be considered an improvement
         for early stopping.
-    
+
     Returns
     -------
     None
         The function modifies the input AnnData object in-place.
-    
+
     Notes
     -----
     Results are stored in the AnnData object as:
-    
+
     - `adata.obsm["X_nmf"]` : ndarray of shape (n_observations, k)
         The low-dimensional NMF representation of the observations.
         Each row corresponds to an observation (cell) and each column
         to a latent factor.
-    
+
     The method supports both sparse (CSR) and dense numpy arrays as input
     and automatically handles batching for memory efficiency with large datasets.
     Training uses early stopping based on log-probability improvement to
     prevent overfitting.
-    
+
     Examples
     --------
     >>> import anndata as ad
     >>> import numpy as np
     >>> from countdown import nmf
-    >>> 
+    >>>
     >>> # Create example count data
     >>> X = np.random.poisson(5, size=(1000, 2000))
     >>> adata = ad.AnnData(X)
-    >>> 
+    >>>
     >>> # Apply NMF with 32 components
     >>> nmf(adata, k=32)
-    >>> 
+    >>>
     >>> # Access the results
     >>> print(adata.obsm["X_nmf"].shape)  # (1000, 32)
     """
