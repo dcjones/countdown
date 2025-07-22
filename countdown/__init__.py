@@ -59,9 +59,9 @@ class Encoder(nnx.Module):
 
     def __call__(self, X: jax.Array):
         u = self.lyr1(X)
-        u = nnx.relu(u)
+        u = nnx.tanh(u)
         u = self.lyr2(u)
-        u = nnx.relu(u)
+        u = nnx.tanh(u)
         u = self.lyr3(u)
         return nnx.softplus(u)
 
@@ -89,7 +89,7 @@ def train_step(model: NMF, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, X
     metrics.update(neg_logprob=loss)
     optimizer.update(grads)
 
-def nmf(adata: AnnData, k: int = 64, batch_size: int | None = 4096, hidden_dim=256, lr=5e-3, max_epochs: int = 2000, patience: int = 40, min_delta: float = 1e-4):
+def nmf(adata: AnnData, k: int = 64, batch_size: int | None = 4096, hidden_dim=512, lr=5e-3, max_epochs: int = 2000, patience: int = 40, min_delta: float = 1e-4):
     """
     Perform Non-negative Matrix Factorization (NMF) on genomic count data.
 
