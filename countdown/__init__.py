@@ -77,7 +77,7 @@ class NMF(nnx.Module):
 
 def neg_logprob(model: NMF, X: jax.Array):
     λ = model(X)
-    lp = X * jnp.log(λ) - λ
+    lp = X * jnp.log(λ + 1e-8) - λ
     # excluding the normalizing term which is expensive and constant wrt to model params
     # - gammaln(X + 1)
     return -jnp.mean(lp)
