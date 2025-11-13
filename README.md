@@ -36,6 +36,6 @@ adata.obsm["X_nmf"] # contains a matrix of size [ncells, 100]
 
 Compared to more common NMF implementations, there are a few difference geared towards usefulness in analyzing large sparse matrices of integer counts, like in transcriptomics.
 
-  * We optimize Poisson likelihood in a simple latent factorization model:$X_{cg} \sim \text{Poisson}(U_{c\cdot} V_{\cdot g})$, where $X_{cg}$ is the observed count for cell $c$ and gene $g$, $U$ is the inferred lower-dimensional "metagene" expression matrix, and $V$ defines the metagenes as a linear combinations of genes.
+  * We optimize Poisson likelihood in a simple latent factorization model: $X_{cg} \sim \text{Poisson}(U_{c\cdot} V_{\cdot g})$, where $X_{cg}$ is the observed count for cell $c$ and gene $g$, $U$ is the inferred lower-dimensional "metagene" expression matrix, and $V$ defines the metagenes as a linear combinations of genes.
   * We constrain the rows of $V$ to sum to 1. As a consequence the rows of $U$ sum approximately to the same values as the rows of $X$, essentially preserving a cell's overall expression.
   * We avoid converting a sparse count matrix into a dense matrix all at once by training on randomly sampled minibatches. To do this, a MLP probabilistic encoder is trained, in similar fashion to a VAE, to map cell count vectors to their decomposition. This is particularly useful when using a GPU with limited memory.
