@@ -68,8 +68,8 @@ class Encoder(nnx.Module):
     def __init__(
         self, n: int, k: int, batch_size: int, hidden_dim: int, *, rngs: nnx.Rngs
     ):
-        self.lyr1 = nnx.Linear(n, hidden_dim, rngs=rngs)
-        self.lyr2 = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
+        self.lyr1 = nnx.Linear(n, hidden_dim // 2, rngs=rngs)
+        self.lyr2 = nnx.Linear(hidden_dim // 2, hidden_dim, rngs=rngs)
         self.lyr3 = nnx.Linear(hidden_dim, k, rngs=rngs)
         self.ln2 = nnx.LayerNorm(hidden_dim, rngs=rngs)
 
@@ -85,20 +85,22 @@ class Encoder(nnx.Module):
         # jax.debug.print("u: [{}] {}", u.shape, jnp.max(u, axis=0))
         # jax.debug.print(f"u: {}", u.shape, jnp.max(u, axis=0) > )
         # u_sp = nnx.softplus(u) + 1e-3
-        # u_sp = nnx.softplus(u) + 1e-3
-        u_sp = jnp.exp(u)
+        u_sp = nnx.softplus(u)
+        # u_sp = jnp.exp(u)
         # jax.debug.print("{}", (jnp.max(u, axis=0) > 1e-2).sum())
         return u_sp
         # return nnx.softplus(u)
 
 
 class NMF(nnx.Module):
+    μm
     def __init__(
         self, n: int, k: int, batch_size: int, hidden_dim: int, *, rngs: nnx.Rngs
     ):
         key = rngs.params()
         self.encoder = Encoder(n, k, batch_size, hidden_dim, rngs=rngs)
-        self.v = nnx.Param(jax.random.normal(key, (k, n)))
+        self.scale = nnx.Param(jnp.zeros((1, n)))
+        self.v = nnx.Param(jax.random.normal(key, (k, n)) / jnp.sqrt(n))
 
     # X: [batch_size, n]
     def __call__(self, X: jax.Array):
@@ -106,19 +108,22 @@ class NMF(nnx.Module):
         # v_norm = nnx.softmax(self.v.value, axis=1)
 
         # return self.encoder(jnp.log1p(X)) @ self.v_norm()
-        return self.encoder(X) @ self.v_norm()
+        return self.encoder(X) @ self.v_scaled()
 
     def v_norm(self):
         # v_pos = nnx.softplus(self.v.value) + 1e-8
-        # return v_pos / v_pos.sum(axis=1, keepdims=True)
+        # return v_pos / v_pos.sum(axis=0, keepdims=True)
 
         # return nnx.softmax(self.v.value, axis=1)
         return nnx.softmax(self.v.value, axis=0)
 
+    def v_scaled(self):
+        return jnp.exp(self.scale.value) * self.v_norm()
+
 
 def neg_logprob(model: NMF, X: jax.Array):
     λ = model(X)
-    lp = X * jnp.log(λ + 1e-8) - λ
+    lp = X * jnp.log(jnp.clip(λ, 1e-10)) - λ
     # excluding the normalizing term which is expensive and constant wrt to model params
     # lp -= jax.scipy.special.gammaln(X + 1)
     return -jnp.mean(lp)
@@ -335,7 +340,7 @@ def nmf(
                 )
                 break
 
-    v = model.v_norm()
+    v = model.v_scaled()
 
     # Map entire X matrix through encoder in chunks
     Xnmf = np.zeros((m, k), dtype=np.float32)
@@ -345,6 +350,7 @@ def nmf(
 
         X_chunk = as_dense_f32(X[start_idx:end_idx, :])
         X_chunk = jnp.array(X_chunk, dtype=jnp.float32)
+        # encoded_chunk = model.encoder(jnp.log1p(X_chunk))
         encoded_chunk = model.encoder(X_chunk)
 
         λ = encoded_chunk @ v
@@ -356,5 +362,6 @@ def nmf(
 
     # Store in AnnData object
     adata.obsm["X_nmf"] = Xnmf
-    adata.varm["V_nmf"] = np.asarray(v).transpose()
+    adata.varm["V_nmf"] = np.asarray(model.v_norm()).transpose()
+    adata.varm["scale_nmf"] = np.asarray(model.scale.value).squeeze()
     adata.uns["nmf_log_likelihood"] = float(ll)
