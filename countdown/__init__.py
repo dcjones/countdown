@@ -105,10 +105,15 @@ class NMF(nnx.Module):
         # jax.debug.print("v: {}", jnp.max(self.v.value, axis=1))
         # v_norm = nnx.softmax(self.v.value, axis=1)
 
-        v_pos = nnx.softplus(self.v.value) + 1e-8
-        v_norm = v_pos / v_pos.sum(axis=1, keepdims=True)
+        # return self.encoder(jnp.log1p(X)) @ self.v_norm()
+        return self.encoder(X) @ self.v_norm()
 
-        return self.encoder(jnp.log1p(X)) @ v_norm
+    def v_norm(self):
+        # v_pos = nnx.softplus(self.v.value) + 1e-8
+        # return v_pos / v_pos.sum(axis=1, keepdims=True)
+
+        # return nnx.softmax(self.v.value, axis=1)
+        return nnx.softmax(self.v.value, axis=0)
 
 
 def neg_logprob(model: NMF, X: jax.Array):
@@ -330,8 +335,11 @@ def nmf(
                 )
                 break
 
+    v = model.v_norm()
+
     # Map entire X matrix through encoder in chunks
     Xnmf = np.zeros((m, k), dtype=np.float32)
+    ll = 0.0
     for start_idx in range(0, m, batch_size):
         end_idx = min(start_idx + batch_size, m)
 
@@ -339,7 +347,14 @@ def nmf(
         X_chunk = jnp.array(X_chunk, dtype=jnp.float32)
         encoded_chunk = model.encoder(X_chunk)
 
+        λ = encoded_chunk @ v
+        ll += jnp.sum(
+            X_chunk * jnp.log(λ + 1e-8) - λ - jax.scipy.special.gammaln(X_chunk + 1)
+        )
+
         Xnmf[start_idx:end_idx, :] = np.array(encoded_chunk)
 
     # Store in AnnData object
     adata.obsm["X_nmf"] = Xnmf
+    adata.varm["V_nmf"] = np.asarray(v).transpose()
+    adata.uns["nmf_log_likelihood"] = float(ll)
