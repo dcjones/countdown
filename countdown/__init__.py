@@ -1,9 +1,15 @@
+import sys
+from queue import Queue
+from threading import Thread
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 from anndata import AnnData
 from flax import nnx
+from jax._src.interpreters.batching import batch
+from jax.experimental.sparse import BCOO, BCSR
 from scipy.sparse import csr_matrix
 from tqdm import tqdm
 
@@ -18,9 +24,10 @@ def as_dense_f32(X: csr_matrix | np.ndarray) -> np.ndarray:
 class CSRMatrixRowSampler:
     def __init__(self, X: csr_matrix, batch_size: int):
         m, n = X.shape
+        # self.X = BCOO.from_scipy_sparse(X.astype(np.float32), index_dtype=jnp.int32)
         self.X = X.astype(np.float32)
         self.idx = np.arange(m)
-        self.chunk = np.zeros((batch_size, n), dtype=np.float32)
+        # self.chunk = np.zeros((batch_size, n), dtype=np.float32)
         self.batch_size = batch_size
         self.m = m
         self.n = n
@@ -30,16 +37,29 @@ class CSRMatrixRowSampler:
         for fr in range(0, len(self.idx), self.batch_size):
             to = min(fr + self.batch_size, self.m)
             batch_size = to - fr
-            if batch_size == self.batch_size:
-                self.X[self.idx[fr:to], :].todense(out=self.chunk)
-                yield jnp.array(self.chunk)
-            else:
-                # Final partial batch - create appropriately sized array
-                partial_chunk = np.zeros((batch_size, self.n), dtype=np.float32)
-                self.X[self.idx[fr:to], :].todense(out=partial_chunk)
-                yield jnp.array(partial_chunk)
+            batch_indices = self.idx[fr:to]
+            batch_indices.sort()
+
+            yield BCOO.from_scipy_sparse(
+                self.X[batch_indices, :], index_dtype=jnp.int32
+            )
+
+            # TODO: Okay, I think there is something to the idea of densifying on
+            # the GPU.
+            #
+            # chunk = jnp.zeros((batch_size, self.n))
+
+            # if batch_size == self.batch_size:
+            #     self.X[batch_indices, :].todense(out=self.chunk)
+            #     yield jnp.array(self.chunk)
+            # else:
+            #     # Final partial batch - create appropriately sized array
+            #     partial_chunk = np.zeros((batch_size, self.n), dtype=np.float32)
+            #     self.X[batch_indices, :].todense(out=partial_chunk)
+            #     yield jnp.array(partial_chunk)
 
 
+# TODO: Do we even need this, or should we always just assume csr_matrix?
 class DenseMatrixRowSampler:
     def __init__(self, X: np.ndarray, batch_size: int):
         m, n = X.shape
@@ -64,16 +84,36 @@ class DenseMatrixRowSampler:
                 yield jnp.array(partial_chunk)
 
 
+class SparseInputLinear(nnx.Module):
+    """
+    This is just the simplest possible linear layer but using sparse matrix input,
+    and sparse by dense matrix multiply for the weights.
+    """
+
+    def __init__(self, in_features: int, out_features: int, rngs: nnx.Rngs):
+        self.bias = nnx.Param(jnp.zeros(out_features))
+
+        kernel_initializer = nnx.initializers.lecun_normal()
+        kernel_key = rngs.params()
+        self.weights = nnx.Param(
+            kernel_initializer(kernel_key, (in_features, out_features), jnp.float32)
+        )
+
+    def __call__(self, X: BCOO):
+        return X @ self.weights.value + self.bias.value
+
+
 class Encoder(nnx.Module):
     def __init__(
         self, n: int, k: int, batch_size: int, hidden_dim: int, *, rngs: nnx.Rngs
     ):
-        self.lyr1 = nnx.Linear(n, hidden_dim // 2, rngs=rngs)
+        # self.lyr1 = nnx.Linear(n, hidden_dim // 2, rngs=rngs)
+        self.lyr1 = SparseInputLinear(n, hidden_dim // 2, rngs=rngs)
         self.lyr2 = nnx.Linear(hidden_dim // 2, hidden_dim, rngs=rngs)
         self.lyr3 = nnx.Linear(hidden_dim, k, rngs=rngs)
         self.ln2 = nnx.LayerNorm(hidden_dim, rngs=rngs)
 
-    def __call__(self, X: jax.Array):
+    def __call__(self, X: BCOO):
         u = self.lyr1(X)
         # u = nnx.tanh(u)
         u = nnx.leaky_relu(u)
@@ -93,7 +133,6 @@ class Encoder(nnx.Module):
 
 
 class NMF(nnx.Module):
-    μm
     def __init__(
         self, n: int, k: int, batch_size: int, hidden_dim: int, *, rngs: nnx.Rngs
     ):
@@ -103,7 +142,7 @@ class NMF(nnx.Module):
         self.v = nnx.Param(jax.random.normal(key, (k, n)) / jnp.sqrt(n))
 
     # X: [batch_size, n]
-    def __call__(self, X: jax.Array):
+    def __call__(self, X: BCOO):
         # jax.debug.print("v: {}", jnp.max(self.v.value, axis=1))
         # v_norm = nnx.softmax(self.v.value, axis=1)
 
@@ -121,12 +160,17 @@ class NMF(nnx.Module):
         return jnp.exp(self.scale.value) * self.v_norm()
 
 
-def neg_logprob(model: NMF, X: jax.Array):
+def neg_logprob(model: NMF, X: BCSR):
     λ = model(X)
-    lp = X * jnp.log(jnp.clip(λ, 1e-10)) - λ
-    # excluding the normalizing term which is expensive and constant wrt to model params
-    # lp -= jax.scipy.special.gammaln(X + 1)
-    return -jnp.mean(lp)
+
+    # What do we do in place of this elemntwise
+
+    lp = (X * jnp.log(jnp.clip(λ, 1e-8))).sum() - jnp.sum(λ)
+    return -lp
+
+    # # excluding the normalizing term which is expensive and constant wrt to model params
+    # # lp -= jax.scipy.special.gammaln(X + 1)
+    # return -jnp.mean(lp)
 
 
 @nnx.jit
