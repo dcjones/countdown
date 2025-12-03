@@ -9,7 +9,7 @@ import optax
 from anndata import AnnData
 from flax import nnx
 from jax._src.interpreters.batching import batch
-from jax.experimental.sparse import BCOO, BCSR
+from jax.experimental.sparse import BCSR, bcsr_dot_general, bcsr_extract
 from scipy.sparse import csr_matrix
 from tqdm import tqdm
 
@@ -24,7 +24,7 @@ def as_dense_f32(X: csr_matrix | np.ndarray) -> np.ndarray:
 class CSRMatrixRowSampler:
     def __init__(self, X: csr_matrix, batch_size: int):
         m, n = X.shape
-        # self.X = BCOO.from_scipy_sparse(X.astype(np.float32), index_dtype=jnp.int32)
+        # self.X = BCSR.from_scipy_sparse(X.astype(np.float32), index_dtype=jnp.int32)
         self.X = X.astype(np.float32)
         self.idx = np.arange(m)
         # self.chunk = np.zeros((batch_size, n), dtype=np.float32)
@@ -40,7 +40,7 @@ class CSRMatrixRowSampler:
             batch_indices = self.idx[fr:to]
             batch_indices.sort()
 
-            yield BCOO.from_scipy_sparse(
+            yield BCSR.from_scipy_sparse(
                 self.X[batch_indices, :], index_dtype=jnp.int32
             )
 
@@ -99,7 +99,7 @@ class SparseInputLinear(nnx.Module):
             kernel_initializer(kernel_key, (in_features, out_features), jnp.float32)
         )
 
-    def __call__(self, X: BCOO):
+    def __call__(self, X: BCSR):
         return X @ self.weights.value + self.bias.value
 
 
@@ -113,7 +113,7 @@ class Encoder(nnx.Module):
         self.lyr3 = nnx.Linear(hidden_dim, k, rngs=rngs)
         self.ln2 = nnx.LayerNorm(hidden_dim, rngs=rngs)
 
-    def __call__(self, X: BCOO):
+    def __call__(self, X: BCSR):
         u = self.lyr1(X)
         # u = nnx.tanh(u)
         u = nnx.leaky_relu(u)
@@ -142,7 +142,7 @@ class NMF(nnx.Module):
         self.v = nnx.Param(jax.random.normal(key, (k, n)) / jnp.sqrt(n))
 
     # X: [batch_size, n]
-    def __call__(self, X: BCOO):
+    def __call__(self, X: BCSR):
         # jax.debug.print("v: {}", jnp.max(self.v.value, axis=1))
         # v_norm = nnx.softmax(self.v.value, axis=1)
 
@@ -163,9 +163,17 @@ class NMF(nnx.Module):
 def neg_logprob(model: NMF, X: BCSR):
     λ = model(X)
 
+    print(X)
+
     # What do we do in place of this elemntwise
 
-    lp = (X * jnp.log(jnp.clip(λ, 1e-8))).sum() - jnp.sum(λ)
+    # lp = (X * jnp.log(jnp.clip(λ, 1e-8))).sum() - jnp.sum(λ)
+    # lp = (X * jnp.log(jnp.clip(λ, 1e-8))).sum() - jnp.sum(λ)
+    # return -lp
+
+    lp = (
+        X.data * jnp.log(jnp.clip(bcsr_extract(X.indices, X.indptr, λ), 1e-8))
+    ).sum() - jnp.sum(λ)
     return -lp
 
     # # excluding the normalizing term which is expensive and constant wrt to model params
@@ -307,15 +315,17 @@ def nmf(
 
     X = adata.X
 
-    if batch_size == m:
-        batch_sampler = [jnp.array(as_dense_f32(X))]
-    else:
-        if isinstance(X, csr_matrix):
-            batch_sampler = CSRMatrixRowSampler(X, batch_size)
-        elif isinstance(X, np.ndarray):
-            batch_sampler = DenseMatrixRowSampler(X, batch_size)
-        else:
-            raise ValueError(f"Unsupported data type: {type(X)}")
+    batch_sampler = CSRMatrixRowSampler(X, batch_size)
+
+    # if batch_size == m:
+    #     batch_sampler = [jnp.array(as_dense_f32(X))]
+    # else:
+    #     if isinstance(X, csr_matrix):
+    #         batch_sampler = CSRMatrixRowSampler(X, batch_size)
+    #     elif isinstance(X, np.ndarray):
+    #         batch_sampler = DenseMatrixRowSampler(X, batch_size)
+    #     else:
+    #         raise ValueError(f"Unsupported data type: {type(X)}")
 
     # Convergence tracking
     best_logprob = -float("inf")
