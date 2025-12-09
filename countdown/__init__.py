@@ -138,9 +138,7 @@ class DenseMatrixRowSampler:
 class Encoder(nnx.Module):
     """Encoder that supports both sparse (BCSR) and dense inputs."""
 
-    def __init__(
-        self, n: int, k: int, hidden_dim: int, *, rngs: nnx.Rngs
-    ):
+    def __init__(self, n: int, k: int, hidden_dim: int, *, rngs: nnx.Rngs):
         # First layer uses manual weights to support sparse @ dense matmul
         self.weights1 = nnx.Param(
             nnx.initializers.lecun_normal()(
@@ -173,7 +171,6 @@ class NMF(nnx.Module):
     ):
         key = rngs.params()
         self.encoder = Encoder(n, k, hidden_dim, rngs=rngs)
-        self.scale = nnx.Param(jnp.zeros((1, n)))
         self.v = nnx.Param(jax.random.normal(key, (k, n)) / jnp.sqrt(n))
 
     # X: [batch_size, n]
@@ -181,10 +178,10 @@ class NMF(nnx.Module):
         return self.encoder(X) @ self.v_scaled()
 
     def v_norm(self):
-        return nnx.softmax(self.v.value, axis=0)
+        return nnx.softmax(self.v.value, axis=1)
 
     def v_scaled(self):
-        return jnp.exp(self.scale.value) * self.v_norm()
+        return self.v_norm()
 
 
 def neg_logprob_dense(model: NMF, X: jax.Array):
@@ -379,5 +376,5 @@ def nmf(
     # Store in AnnData object
     adata.obsm["X_nmf"] = Xnmf
     adata.varm["V_nmf"] = np.asarray(model.v_norm()).transpose()
-    adata.varm["scale_nmf"] = np.asarray(model.scale.value).squeeze()
+    # adata.varm["scale_nmf"] = np.asarray(model.scale.value).squeeze()
     adata.uns["nmf_log_likelihood"] = float(ll)
