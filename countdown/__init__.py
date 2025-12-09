@@ -135,13 +135,13 @@ class DenseMatrixRowSampler:
                 yield jnp.array(partial_chunk)
 
 
-class SparseEncoder(nnx.Module):
-    """Encoder with sparse input support for the first layer."""
+class Encoder(nnx.Module):
+    """Encoder that supports both sparse (BCSR) and dense inputs."""
 
     def __init__(
-        self, n: int, k: int, batch_size: int, hidden_dim: int, *, rngs: nnx.Rngs
+        self, n: int, k: int, hidden_dim: int, *, rngs: nnx.Rngs
     ):
-        # First layer uses manual weights for sparse @ dense matmul
+        # First layer uses manual weights to support sparse @ dense matmul
         self.weights1 = nnx.Param(
             nnx.initializers.lecun_normal()(
                 rngs.params(), (n, hidden_dim // 2), jnp.float32
@@ -152,29 +152,8 @@ class SparseEncoder(nnx.Module):
         self.lyr3 = nnx.Linear(hidden_dim, k, rngs=rngs)
         self.ln2 = nnx.LayerNorm(hidden_dim, rngs=rngs)
 
-    def __call__(self, X: BCSR):
+    def __call__(self, X: jax.Array | BCSR):
         u = X @ self.weights1.value + self.bias1.value
-        u = nnx.leaky_relu(u)
-        u = self.lyr2(u)
-        u = self.ln2(u)
-        u = nnx.leaky_relu(u)
-        u = self.lyr3(u)
-        return nnx.softplus(u)
-
-
-class DenseEncoder(nnx.Module):
-    """Encoder for dense input."""
-
-    def __init__(
-        self, n: int, k: int, batch_size: int, hidden_dim: int, *, rngs: nnx.Rngs
-    ):
-        self.lyr1 = nnx.Linear(n, hidden_dim // 2, rngs=rngs)
-        self.lyr2 = nnx.Linear(hidden_dim // 2, hidden_dim, rngs=rngs)
-        self.lyr3 = nnx.Linear(hidden_dim, k, rngs=rngs)
-        self.ln2 = nnx.LayerNorm(hidden_dim, rngs=rngs)
-
-    def __call__(self, X: jax.Array):
-        u = self.lyr1(X)
         u = nnx.leaky_relu(u)
         u = self.lyr2(u)
         u = self.ln2(u)
@@ -188,20 +167,14 @@ class NMF(nnx.Module):
         self,
         n: int,
         k: int,
-        batch_size: int,
         hidden_dim: int,
         *,
         rngs: nnx.Rngs,
-        sparse: bool = False,
     ):
         key = rngs.params()
-        if sparse:
-            self.encoder = SparseEncoder(n, k, batch_size, hidden_dim, rngs=rngs)
-        else:
-            self.encoder = DenseEncoder(n, k, batch_size, hidden_dim, rngs=rngs)
+        self.encoder = Encoder(n, k, hidden_dim, rngs=rngs)
         self.scale = nnx.Param(jnp.zeros((1, n)))
         self.v = nnx.Param(jax.random.normal(key, (k, n)) / jnp.sqrt(n))
-        self._sparse = sparse
 
     # X: [batch_size, n]
     def __call__(self, X: jax.Array | BCSR):
@@ -332,7 +305,7 @@ def nmf(
         batch_size = m
 
     rngs = nnx.Rngs(0)
-    model = NMF(n, k, batch_size, hidden_dim, rngs=rngs, sparse=sparse)
+    model = NMF(n, k, hidden_dim, rngs=rngs)
 
     optimizer = nnx.Optimizer(model, optax.adam(lr))
     metrics = nnx.MultiMetric(neg_logprob=nnx.metrics.Average("neg_logprob"))
@@ -389,28 +362,12 @@ def nmf(
     Xnmf = np.zeros((m, k), dtype=np.float32)
     ll = 0.0
 
-    # For sparse models, create a function to encode dense chunks
-    # The sparse encoder's first layer is just a matmul, so we can apply it to dense input
-    if sparse:
-
-        def encode_dense(X_dense):
-            u = X_dense @ model.encoder.weights1.value + model.encoder.bias1.value
-            u = nnx.leaky_relu(u)
-            u = model.encoder.lyr2(u)
-            u = model.encoder.ln2(u)
-            u = nnx.leaky_relu(u)
-            u = model.encoder.lyr3(u)
-            return nnx.softplus(u)
-
-    else:
-        encode_dense = model.encoder
-
     for start_idx in range(0, m, output_chunk_size):
         end_idx = min(start_idx + output_chunk_size, m)
 
         X_chunk = as_dense_f32(X[start_idx:end_idx, :])
         X_chunk = jnp.array(X_chunk, dtype=jnp.float32)
-        encoded_chunk = encode_dense(X_chunk)
+        encoded_chunk = model.encoder(X_chunk)
 
         λ = encoded_chunk @ v
         ll += jnp.sum(
