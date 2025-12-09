@@ -222,7 +222,7 @@ def nmf(
     k: int = 64,
     batch_size: int | None = 4096,
     hidden_dim=512,
-    lr=1e-3,
+    lr=1e-2,
     max_epochs: int = 2000,
     patience: int = 40,
     min_delta: float = 1e-5,
