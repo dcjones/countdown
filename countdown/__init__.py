@@ -232,57 +232,19 @@ def neg_logprob_sparse(model: NMF, X: BCSR):
 
 
 @nnx.jit
-def compute_loss_and_grads_dense(model: NMF, X: jax.Array):
-    """Compute loss and gradients for dense input."""
-    grad_fn = nnx.value_and_grad(neg_logprob_dense)
-    loss, grads = grad_fn(model, X)
-    return loss, grads
+def train_step_dense(model: NMF, optimizer: nnx.Optimizer, X: jax.Array):
+    """Fused forward, backward, and optimizer update for dense input."""
+    loss, grads = nnx.value_and_grad(neg_logprob_dense)(model, X)
+    optimizer.update(grads)
+    return loss
 
 
 @nnx.jit
-def compute_loss_and_grads_sparse(model: NMF, X: BCSR):
-    """Compute loss and gradients for sparse BCSR input."""
-    grad_fn = nnx.value_and_grad(neg_logprob_sparse)
-    loss, grads = grad_fn(model, X)
-    return loss, grads
-
-
-def zero_v_grads(grads: nnx.State) -> nnx.State:
-    """Zero out V gradients, keeping only encoder gradients."""
-
-    def zero_if_v(path, var_state):
-        if "v" in path:
-            return var_state.replace(value=jnp.zeros_like(var_state.value))
-        return var_state
-
-    return grads.map(zero_if_v)
-
-
-def zero_encoder_grads(grads: nnx.State) -> nnx.State:
-    """Zero out encoder gradients, keeping only V gradients."""
-
-    def zero_if_encoder(path, var_state):
-        if "encoder" in path:
-            return var_state.replace(value=jnp.zeros_like(var_state.value))
-        return var_state
-
-    return grads.map(zero_if_encoder)
-
-
-def accumulate_grads(
-    acc: nnx.State | None, grads: nnx.State, weight: float
-) -> nnx.State:
-    """Accumulate weighted gradients."""
-    weighted = grads.map(lambda path, vs: vs.replace(value=vs.value * weight))
-    if acc is None:
-        return weighted
-    # Build flat dicts for efficient lookup
-    weighted_flat = dict(weighted.flat_state())
-
-    def add_values(path, acc_vs):
-        return acc_vs.replace(value=acc_vs.value + weighted_flat[path].value)
-
-    return acc.map(add_values)
+def train_step_sparse(model: NMF, optimizer: nnx.Optimizer, X: BCSR):
+    """Fused forward, backward, and optimizer update for sparse BCSR input."""
+    loss, grads = nnx.value_and_grad(neg_logprob_sparse)(model, X)
+    optimizer.update(grads)
+    return loss
 
 
 def nmf(
@@ -379,52 +341,20 @@ def nmf(
 
     if sparse:
         batch_sampler = PaddedBCSRSampler(X, batch_size)
-        compute_loss_and_grads = compute_loss_and_grads_sparse
+        train_step = train_step_sparse
     else:
         batch_sampler = CSRMatrixRowSampler(X, batch_size)
-        compute_loss_and_grads = compute_loss_and_grads_dense
+        train_step = train_step_dense
 
     # Convergence tracking
     best_logprob = -float("inf")
     no_improvement_count = 0
 
-    # For full-batch training, use simple per-batch updates (no accumulation needed)
-    use_gradient_accumulation = batch_size != m
-
     with tqdm(range(max_epochs), desc="Training", unit="epoch") as pbar:
         for epoch in pbar:
-            if use_gradient_accumulation:
-                # Accumulate V gradients across batches, update encoder per-batch
-                v_grad_acc = None
-                total_samples = 0
-
-                for X_batch in batch_sampler:
-                    batch_len = X_batch.shape[0]
-                    loss, grads = compute_loss_and_grads(model, X_batch)
-
-                    # Apply encoder gradients immediately (zero out V)
-                    encoder_grads = zero_v_grads(grads)
-                    optimizer.update(encoder_grads)
-
-                    # Accumulate V gradients weighted by batch size
-                    v_grads = zero_encoder_grads(grads)
-                    v_grad_acc = accumulate_grads(v_grad_acc, v_grads, float(batch_len))
-                    total_samples += batch_len
-
-                    metrics.update(neg_logprob=loss)
-
-                # Apply accumulated V gradient (averaged over all samples)
-                if v_grad_acc is not None and total_samples > 0:
-                    avg_v_grads = v_grad_acc.map(
-                        lambda path, vs: vs.replace(value=vs.value / total_samples)
-                    )
-                    optimizer.update(avg_v_grads)
-            else:
-                # Full-batch training: simple per-batch update
-                for X_batch in batch_sampler:
-                    loss, grads = compute_loss_and_grads(model, X_batch)
-                    optimizer.update(grads)
-                    metrics.update(neg_logprob=loss)
+            for X_batch in batch_sampler:
+                loss = train_step(model, optimizer, X_batch)
+                metrics.update(neg_logprob=loss)
 
             logprob = -metrics.compute()["neg_logprob"]
 
