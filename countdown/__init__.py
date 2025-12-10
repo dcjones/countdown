@@ -215,20 +215,30 @@ class NMF(nnx.Module):
         return jnp.exp(self.log_r.value)
 
 
-def neg_poisson_logprob_dense(model: NMF, X: jax.Array):
+def neg_poisson_logprob_dense(model: NMF, X: jax.Array, constant_terms: bool = False):
     """Negative log probability for dense input."""
     λ = model(X)
     lp = (X * jnp.log(jnp.clip(λ, 1e-8))).sum() - jnp.sum(λ)
+
+    # constant wrt to parameters
+    if constant_terms:
+        lp -= jnp.sum(jax.scipy.special.gammaln(X + 1))
+
     return -lp
 
 
-def neg_poisson_logprob_sparse(model: NMF, X: BCSR):
+def neg_poisson_logprob_sparse(model: NMF, X: BCSR, constant_terms: bool = False):
     """Negative log probability for sparse BCSR input."""
     λ = model(X)
     # Extract λ values only at non-zero positions of X
     lp = (
         X.data * jnp.log(jnp.clip(bcsr_extract(X.indices, X.indptr, λ), 1e-8))
     ).sum() - jnp.sum(λ)
+
+    # constant wrt to parameters
+    if constant_terms:
+        lp -= jnp.sum(jax.scipy.special.gammaln(X.data + 1))
+
     return -lp
 
 
@@ -301,21 +311,42 @@ def neg_nb_logprob_sparse(model: NMF, X: BCSR, constant_terms: bool = False):
     return -lp
 
 
-@nnx.jit
-def train_step_dense(model: NMF, optimizer: nnx.Optimizer, X: jax.Array):
-    """Fused forward, backward, and optimizer update for dense input."""
-    loss, grads = nnx.value_and_grad(neg_poisson_logprob_dense)(model, X)
-    optimizer.update(grads)
-    return loss
+def create_train_step_dense(likelihood: str):
+    """Create a JIT-compiled training step for dense input with specified likelihood."""
+    if likelihood == "nb":
+        loss_fn = neg_nb_logprob_dense
+    elif likelihood == "poisson":
+        loss_fn = neg_poisson_logprob_dense
+    else:
+        raise ValueError(f"Unknown likelihood: {likelihood}. Must be 'nb' or 'poisson'.")
+
+    @nnx.jit
+    def train_step(model: NMF, optimizer: nnx.Optimizer, X: jax.Array):
+        """Fused forward, backward, and optimizer update for dense input."""
+        loss, grads = nnx.value_and_grad(loss_fn)(model, X)
+        optimizer.update(grads)
+        return loss
+
+    return train_step
 
 
-@nnx.jit
-def train_step_sparse(model: NMF, optimizer: nnx.Optimizer, X: BCSR):
-    """Fused forward, backward, and optimizer update for sparse BCSR input."""
-    # loss, grads = nnx.value_and_grad(neg_poisson_logprob_sparse)(model, X)
-    loss, grads = nnx.value_and_grad(neg_nb_logprob_sparse)(model, X)
-    optimizer.update(grads)
-    return loss
+def create_train_step_sparse(likelihood: str):
+    """Create a JIT-compiled training step for sparse BCSR input with specified likelihood."""
+    if likelihood == "nb":
+        loss_fn = neg_nb_logprob_sparse
+    elif likelihood == "poisson":
+        loss_fn = neg_poisson_logprob_sparse
+    else:
+        raise ValueError(f"Unknown likelihood: {likelihood}. Must be 'nb' or 'poisson'.")
+
+    @nnx.jit
+    def train_step(model: NMF, optimizer: nnx.Optimizer, X: BCSR):
+        """Fused forward, backward, and optimizer update for sparse BCSR input."""
+        loss, grads = nnx.value_and_grad(loss_fn)(model, X)
+        optimizer.update(grads)
+        return loss
+
+    return train_step
 
 
 def nmf(
@@ -415,10 +446,10 @@ def nmf(
 
     if sparse:
         batch_sampler = PaddedBCSRSampler(X, batch_size)
-        train_step = train_step_sparse
+        train_step = create_train_step_sparse(likelihood)
     else:
         batch_sampler = CSRMatrixRowSampler(X, batch_size)
-        train_step = train_step_dense
+        train_step = create_train_step_dense(likelihood)
 
     # Convergence tracking
     best_logprob = -float("inf")
@@ -463,6 +494,14 @@ def nmf(
     Xnmf = np.zeros((m, k), dtype=np.float32)
     ll = 0.0
 
+    # Select the appropriate likelihood function for final computation
+    if likelihood == "nb":
+        final_loss_fn = neg_nb_logprob_dense
+    elif likelihood == "poisson":
+        final_loss_fn = neg_poisson_logprob_dense
+    else:
+        raise ValueError(f"Unknown likelihood: {likelihood}. Must be 'nb' or 'poisson'.")
+
     for start_idx in range(0, m, output_chunk_size):
         end_idx = min(start_idx + output_chunk_size, m)
 
@@ -471,7 +510,7 @@ def nmf(
         encoded_chunk = model.encoder(X_chunk)
 
         λ = encoded_chunk @ v
-        ll += -neg_nb_logprob_dense(model, X_chunk, constant_terms=True)
+        ll += -final_loss_fn(model, X_chunk, constant_terms=True)
 
         Xnmf[start_idx:end_idx, :] = np.array(encoded_chunk)
 
