@@ -1,9 +1,12 @@
+import sys
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 from anndata import AnnData
 from flax import nnx
+from jax._src.dtypes import JAXType
 from jax.experimental.sparse import BCSR, bcsr_extract
 from scipy.sparse import csr_matrix
 from tqdm import tqdm
@@ -196,26 +199,30 @@ class NMF(nnx.Module):
         self.encoder = SimpleEncoder(n, k, rngs=rngs)
         # self.encoder = Encoder(n, k, hidden_dim=hidden_dim, rngs=rngs)
         self.v = nnx.Param(jax.random.normal(key, (k, n)) / jnp.sqrt(n))
+        self.log_r = nnx.Param(jnp.full(n, 1e-1))
 
     # X: [batch_size, n]
-    def __call__(self, X: jax.Array | BCSR):
+    def __call__(self, X: jax.Array | BCSR) -> jax.Array:
         return self.encoder(X) @ self.v_scaled()
 
-    def v_norm(self):
+    def v_norm(self) -> jax.Array:
         return nnx.softmax(self.v.value, axis=1)
 
-    def v_scaled(self):
+    def v_scaled(self) -> jax.Array:
         return self.v_norm()
 
+    def r(self) -> jax.Array:
+        return jnp.exp(self.log_r.value)
 
-def neg_logprob_dense(model: NMF, X: jax.Array):
+
+def neg_poisson_logprob_dense(model: NMF, X: jax.Array):
     """Negative log probability for dense input."""
     λ = model(X)
     lp = (X * jnp.log(jnp.clip(λ, 1e-8))).sum() - jnp.sum(λ)
     return -lp
 
 
-def neg_logprob_sparse(model: NMF, X: BCSR):
+def neg_poisson_logprob_sparse(model: NMF, X: BCSR):
     """Negative log probability for sparse BCSR input."""
     λ = model(X)
     # Extract λ values only at non-zero positions of X
@@ -225,10 +232,79 @@ def neg_logprob_sparse(model: NMF, X: BCSR):
     return -lp
 
 
+def neg_nb_logprob_dense(model: NMF, X: jax.Array, constant_terms: bool = False):
+    λ = model(X)  # [ncells, ngenes]
+    r = jnp.expand_dims(model.r(), 0)  # [1, ngenes]
+    log_r = jnp.expand_dims(model.log_r.value, 0)  # [1, ngenes]
+    log_λr = jnp.log(λ + r)  # [ncells, ngenes]
+    log_λ = jnp.log(λ)
+    gammaln_r = jax.scipy.special.gammaln(r)  # [1, ngenes]
+
+    ncells = X.shape[0]
+
+    lp = 0.0
+    lp += -jnp.sum(ncells * gammaln_r)
+
+    lp += jnp.sum(ncells * r * log_r)
+    lp -= jnp.sum(r * jnp.sum(log_λr, axis=0, keepdims=True))
+    lp += jnp.sum(X * (log_λ - log_λr))
+    lp += jnp.sum(jax.scipy.special.gammaln(X + r))
+
+    # constant wrt to parameters
+    if constant_terms:
+        lp -= jnp.sum(jax.scipy.special.gammaln(X + 1))
+
+    return -lp
+
+
+def neg_nb_logprob_sparse(model: NMF, X: BCSR, constant_terms: bool = False):
+    λ = model(X)  # [ncells, ngenes]
+    r = jnp.expand_dims(model.r(), 0)  # [1, ngenes]
+    log_r = jnp.expand_dims(model.log_r.value, 0)  # [1, ngenes]
+    log_λr = jnp.log(λ + r)  # [ncells, ngenes]
+    log_λ = jnp.log(λ)
+    gammaln_r = jax.scipy.special.gammaln(r)  # [1, ngenes]
+
+    ncells = X.shape[0]
+
+    lp = 0.0
+    lp += -jnp.sum(ncells * gammaln_r)
+
+    lp += jnp.sum(ncells * r * log_r)
+    lp -= jnp.sum(r * jnp.sum(log_λr, axis=0, keepdims=True))
+
+    lp += jnp.sum(X.data * bcsr_extract(X.indices, X.indptr, log_λ - log_λr))
+
+    # Ok, this is the really tricky one. I don't think there are any sparsity
+    # tricks I can use. Gotta convert X to dense I guess?
+
+    # This is the naive way to do this, but it feels like there should be some way to exploit
+    # the sparsity of X to do this faster.
+    #
+    # Here we end up computing gammaln() many times on the same value of r.
+    # lp += jnp.sum(jax.scipy.special.gammaln(X.todense() + r))
+
+    # Alternative, we can just do this, then subtract out
+    # the terms we want, etc.
+    lp += jnp.sum(ncells * gammaln_r)
+
+    # subtract out the log(gamma(r)) values where X is nonzero.
+    lp -= jnp.sum(gammaln_r[0, X.indices])
+
+    # compute just the log(gamma(r + x)) values we need
+    lp += jnp.sum(jax.scipy.special.gammaln(r[0, X.indices] + X.data))
+
+    # constant wrt to parameters
+    if constant_terms:
+        lp -= jnp.sum(jax.scipy.special.gammaln(X.data + 1))
+
+    return -lp
+
+
 @nnx.jit
 def train_step_dense(model: NMF, optimizer: nnx.Optimizer, X: jax.Array):
     """Fused forward, backward, and optimizer update for dense input."""
-    loss, grads = nnx.value_and_grad(neg_logprob_dense)(model, X)
+    loss, grads = nnx.value_and_grad(neg_poisson_logprob_dense)(model, X)
     optimizer.update(grads)
     return loss
 
@@ -236,7 +312,8 @@ def train_step_dense(model: NMF, optimizer: nnx.Optimizer, X: jax.Array):
 @nnx.jit
 def train_step_sparse(model: NMF, optimizer: nnx.Optimizer, X: BCSR):
     """Fused forward, backward, and optimizer update for sparse BCSR input."""
-    loss, grads = nnx.value_and_grad(neg_logprob_sparse)(model, X)
+    # loss, grads = nnx.value_and_grad(neg_poisson_logprob_sparse)(model, X)
+    loss, grads = nnx.value_and_grad(neg_nb_logprob_sparse)(model, X)
     optimizer.update(grads)
     return loss
 
@@ -251,6 +328,7 @@ def nmf(
     patience: int = 40,
     min_delta: float = 1e-5,
     sparse: bool = True,
+    likelihood: str = "nb",
 ):
     """
     Perform Non-negative Matrix Factorization (NMF) on genomic count data.
@@ -284,6 +362,8 @@ def nmf(
     sparse : bool, default=True
         If True, use sparse BCSR batches (memory efficient, allows larger batches).
         If False, use dense batches (may be faster for smaller matrices).
+    likelihood : str, default="nb"
+        Likelihood function to use for the NMF model. Either "nb" or "poisson".
 
     Returns
     -------
@@ -391,9 +471,7 @@ def nmf(
         encoded_chunk = model.encoder(X_chunk)
 
         λ = encoded_chunk @ v
-        ll += jnp.sum(
-            X_chunk * jnp.log(λ + 1e-8) - λ - jax.scipy.special.gammaln(X_chunk + 1)
-        )
+        ll += -neg_nb_logprob_dense(model, X_chunk, constant_terms=True)
 
         Xnmf[start_idx:end_idx, :] = np.array(encoded_chunk)
 
