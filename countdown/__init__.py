@@ -194,12 +194,18 @@ class NMF(nnx.Module):
         hidden_dim: int,
         *,
         rngs: nnx.Rngs,
+        r_prior_alpha: float = 2.0,
+        r_prior_beta: float = 2.0,
     ):
         key = rngs.params()
         self.encoder = SimpleEncoder(n, k, rngs=rngs)
         # self.encoder = Encoder(n, k, hidden_dim=hidden_dim, rngs=rngs)
         self.v = nnx.Param(jax.random.normal(key, (k, n)) / jnp.sqrt(n))
         self.log_r = nnx.Param(jnp.full(n, 1e-1))
+
+        # Store Gamma prior hyperparameters (not trainable)
+        self.r_prior_alpha = r_prior_alpha
+        self.r_prior_beta = r_prior_beta
 
     # X: [batch_size, n]
     def __call__(self, X: jax.Array | BCSR) -> jax.Array:
@@ -214,6 +220,32 @@ class NMF(nnx.Module):
     def r(self) -> jax.Array:
         return jnp.exp(self.log_r.value)
 
+    def log_prior(self) -> jax.Array:
+        """
+        Compute log prior for all parameters.
+
+        Currently implements:
+        - Gamma(alpha, beta) prior on dispersion parameters r
+
+        Returns negative log prior (to be minimized).
+        """
+        r = self.r()
+
+        # Gamma prior: p(r) = (beta^alpha / Gamma(alpha)) * r^(alpha-1) * exp(-beta * r)
+        # log p(r) = alpha * log(beta) - log(Gamma(alpha)) + (alpha-1) * log(r) - beta * r
+        alpha = self.r_prior_alpha
+        beta = self.r_prior_beta
+
+        log_prior = (
+            alpha * jnp.log(beta)
+            - jax.scipy.special.gammaln(alpha)
+            + (alpha - 1) * jnp.log(r)
+            - beta * r
+        )
+
+        # Sum over all genes and return negative (since we minimize)
+        return -jnp.sum(log_prior)
+
 
 def neg_poisson_logprob_dense(model: NMF, X: jax.Array, constant_terms: bool = False):
     """Negative log probability for dense input."""
@@ -224,7 +256,12 @@ def neg_poisson_logprob_dense(model: NMF, X: jax.Array, constant_terms: bool = F
     if constant_terms:
         lp -= jnp.sum(jax.scipy.special.gammaln(X + 1))
 
-    return -lp
+    neg_log_likelihood = -lp
+
+    # Add negative log prior (for MAP estimation)
+    neg_log_posterior = neg_log_likelihood + model.log_prior()
+
+    return neg_log_posterior
 
 
 def neg_poisson_logprob_sparse(model: NMF, X: BCSR, constant_terms: bool = False):
@@ -239,7 +276,12 @@ def neg_poisson_logprob_sparse(model: NMF, X: BCSR, constant_terms: bool = False
     if constant_terms:
         lp -= jnp.sum(jax.scipy.special.gammaln(X.data + 1))
 
-    return -lp
+    neg_log_likelihood = -lp
+
+    # Add negative log prior (for MAP estimation)
+    neg_log_posterior = neg_log_likelihood + model.log_prior()
+
+    return neg_log_posterior
 
 
 def neg_nb_logprob_dense(model: NMF, X: jax.Array, constant_terms: bool = False):
@@ -264,7 +306,12 @@ def neg_nb_logprob_dense(model: NMF, X: jax.Array, constant_terms: bool = False)
     if constant_terms:
         lp -= jnp.sum(jax.scipy.special.gammaln(X + 1))
 
-    return -lp
+    neg_log_likelihood = -lp
+
+    # Add negative log prior (for MAP estimation)
+    neg_log_posterior = neg_log_likelihood + model.log_prior()
+
+    return neg_log_posterior
 
 
 def neg_nb_logprob_sparse(model: NMF, X: BCSR, constant_terms: bool = False):
@@ -285,30 +332,29 @@ def neg_nb_logprob_sparse(model: NMF, X: BCSR, constant_terms: bool = False):
 
     lp += jnp.sum(X.data * bcsr_extract(X.indices, X.indptr, log_λ - log_λr))
 
-    # Ok, this is the really tricky one. I don't think there are any sparsity
-    # tricks I can use. Gotta convert X to dense I guess?
-
-    # This is the naive way to do this, but it feels like there should be some way to exploit
-    # the sparsity of X to do this faster.
-    #
-    # Here we end up computing gammaln() many times on the same value of r.
+    # This is the naive implementation of this term, which requires
+    # densifying X and redundantly computing gammaln across many identical values.
     # lp += jnp.sum(jax.scipy.special.gammaln(X.todense() + r))
 
-    # Alternative, we can just do this, then subtract out
-    # the terms we want, etc.
+    # Alternative, we can just do this, then subtract out the terms we want, etc.
     lp += jnp.sum(ncells * gammaln_r)
 
     # subtract out the log(gamma(r)) values where X is nonzero.
     lp -= jnp.sum(gammaln_r[0, X.indices])
 
-    # compute just the log(gamma(r + x)) values we need
+    # compute just the log(gamma(r + x)) values where X is nonzero
     lp += jnp.sum(jax.scipy.special.gammaln(r[0, X.indices] + X.data))
 
     # constant wrt to parameters
     if constant_terms:
         lp -= jnp.sum(jax.scipy.special.gammaln(X.data + 1))
 
-    return -lp
+    neg_log_likelihood = -lp
+
+    # Add negative log prior (for MAP estimation)
+    neg_log_posterior = neg_log_likelihood + model.log_prior()
+
+    return neg_log_posterior
 
 
 def create_train_step_dense(likelihood: str):
@@ -318,7 +364,9 @@ def create_train_step_dense(likelihood: str):
     elif likelihood == "poisson":
         loss_fn = neg_poisson_logprob_dense
     else:
-        raise ValueError(f"Unknown likelihood: {likelihood}. Must be 'nb' or 'poisson'.")
+        raise ValueError(
+            f"Unknown likelihood: {likelihood}. Must be 'nb' or 'poisson'."
+        )
 
     @nnx.jit
     def train_step(model: NMF, optimizer: nnx.Optimizer, X: jax.Array):
@@ -337,7 +385,9 @@ def create_train_step_sparse(likelihood: str):
     elif likelihood == "poisson":
         loss_fn = neg_poisson_logprob_sparse
     else:
-        raise ValueError(f"Unknown likelihood: {likelihood}. Must be 'nb' or 'poisson'.")
+        raise ValueError(
+            f"Unknown likelihood: {likelihood}. Must be 'nb' or 'poisson'."
+        )
 
     @nnx.jit
     def train_step(model: NMF, optimizer: nnx.Optimizer, X: BCSR):
@@ -360,6 +410,8 @@ def nmf(
     min_delta: float = 1e-5,
     sparse: bool = True,
     likelihood: str = "nb",
+    r_prior_alpha: float = 2.0,
+    r_prior_beta: float = 2.0,
 ):
     """
     Perform Non-negative Matrix Factorization (NMF) on genomic count data.
@@ -395,6 +447,14 @@ def nmf(
         If False, use dense batches (may be faster for smaller matrices).
     likelihood : str, default="nb"
         Likelihood function to use for the NMF model. Either "nb" or "poisson".
+    r_prior_alpha : float, default=2.0
+        Shape parameter (alpha) for the Gamma prior on dispersion parameters r.
+        For Gamma(alpha, beta), the mean is alpha/beta and mode is (alpha-1)/beta.
+        Larger values make the prior more concentrated around the mean.
+    r_prior_beta : float, default=2.0
+        Rate parameter (beta) for the Gamma prior on dispersion parameters r.
+        For Gamma(alpha, beta), the mean is alpha/beta and mode is (alpha-1)/beta.
+        Larger values push the prior towards smaller r values.
 
     Returns
     -------
@@ -437,7 +497,9 @@ def nmf(
         batch_size = m
 
     rngs = nnx.Rngs(0)
-    model = NMF(n, k, hidden_dim, rngs=rngs)
+    model = NMF(
+        n, k, hidden_dim, rngs=rngs, r_prior_alpha=r_prior_alpha, r_prior_beta=r_prior_beta
+    )
 
     optimizer = nnx.Optimizer(model, optax.adam(lr))
     metrics = nnx.MultiMetric(neg_logprob=nnx.metrics.Average("neg_logprob"))
@@ -500,7 +562,9 @@ def nmf(
     elif likelihood == "poisson":
         final_loss_fn = neg_poisson_logprob_dense
     else:
-        raise ValueError(f"Unknown likelihood: {likelihood}. Must be 'nb' or 'poisson'.")
+        raise ValueError(
+            f"Unknown likelihood: {likelihood}. Must be 'nb' or 'poisson'."
+        )
 
     for start_idx in range(0, m, output_chunk_size):
         end_idx = min(start_idx + output_chunk_size, m)
