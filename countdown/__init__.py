@@ -135,6 +135,21 @@ class DenseMatrixRowSampler:
                 yield jnp.array(partial_chunk)
 
 
+class SimpleEncoder(nnx.Module):
+    """
+    Simple single-layer encode.
+    """
+
+    def __init__(self, n: int, k: int, *, rngs: nnx.Rngs):
+        self.weights = nnx.Param(
+            nnx.initializers.lecun_normal()(rngs.params(), (n, k), jnp.float32)
+        )
+        self.bias = nnx.Param(jnp.zeros(k))
+
+    def __call__(self, X: jax.Array | BCSR):
+        return nnx.softplus(X @ self.weights.value + self.bias.value)
+
+
 class Encoder(nnx.Module):
     """Encoder that supports both sparse (BCSR) and dense inputs."""
 
@@ -146,18 +161,26 @@ class Encoder(nnx.Module):
             )
         )
         self.bias1 = nnx.Param(jnp.zeros(hidden_dim // 2))
+
+        self.weights_shortcut = nnx.Param(
+            nnx.initializers.lecun_normal()(rngs.params(), (n, k), jnp.float32)
+        )
+        self.bias_shortcut = nnx.Param(jnp.zeros(k))
+
         self.lyr2 = nnx.Linear(hidden_dim // 2, hidden_dim, rngs=rngs)
         self.lyr3 = nnx.Linear(hidden_dim, k, rngs=rngs)
-        self.ln2 = nnx.LayerNorm(hidden_dim, rngs=rngs)
+
+        self.ln1 = nnx.LayerNorm(hidden_dim // 2, rngs=rngs)
 
     def __call__(self, X: jax.Array | BCSR):
+        residual = X @ self.weights_shortcut.value + self.bias_shortcut.value
         u = X @ self.weights1.value + self.bias1.value
+        u = self.ln1(u)
         u = nnx.leaky_relu(u)
         u = self.lyr2(u)
-        u = self.ln2(u)
         u = nnx.leaky_relu(u)
         u = self.lyr3(u)
-        return nnx.softplus(u)
+        return nnx.softplus(u) + nnx.softplus(residual)
 
 
 class NMF(nnx.Module):
@@ -170,7 +193,8 @@ class NMF(nnx.Module):
         rngs: nnx.Rngs,
     ):
         key = rngs.params()
-        self.encoder = Encoder(n, k, hidden_dim, rngs=rngs)
+        self.encoder = SimpleEncoder(n, k, rngs=rngs)
+        # self.encoder = Encoder(n, k, hidden_dim=hidden_dim, rngs=rngs)
         self.v = nnx.Param(jax.random.normal(key, (k, n)) / jnp.sqrt(n))
 
     # X: [batch_size, n]
@@ -248,7 +272,7 @@ def nmf(
         dataset (batch_size = n_observations) for training.
     hidden_dim : int, default=512
         Number of hidden units in the encoder neural network.
-    lr : float, default=1e-3
+    lr : float, default=1e-2
         Learning rate for the Adam optimizer.
     max_epochs : int, default=2000
         Maximum number of training epochs.
