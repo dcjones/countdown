@@ -140,7 +140,14 @@ class DenseMatrixRowSampler:
 
 class SimpleEncoder(nnx.Module):
     """
-    Simple single-layer encoder that outputs both NMF factors U and log-scale.
+    Simple single-layer encoder: X -> linear -> softplus -> U
+
+    Architecture:
+    - Single linear projection from input to factors
+    - Separate linear layer for scale prediction
+    - Fast, low correlation, good baseline
+
+    Best for: Quick results, interpretability, low metagene correlation
     """
 
     def __init__(self, n: int, k: int, *, rngs: nnx.Rngs):
@@ -163,42 +170,126 @@ class SimpleEncoder(nnx.Module):
         return u, log_scale
 
 
-class Encoder(nnx.Module):
-    """Encoder that supports both sparse (BCSR) and dense inputs, outputs U and log-scale."""
+class DeepSoftplusEncoder(nnx.Module):
+    """
+    Two-layer encoder with softplus activations: X -> hidden -> output
+
+    Architecture:
+    - Input -> hidden_dim (softplus) -> k (softplus)
+    - Softplus activations work well with count data
+    - Scale predicted directly from input
+
+    Best for: Maximum likelihood with regularization
+    Recommended with: metagene_reg_type="correlation", metagene_reg_strength=0.01
+    """
 
     def __init__(self, n: int, k: int, hidden_dim: int, *, rngs: nnx.Rngs):
-        # First layer uses manual weights to support sparse @ dense matmul
         self.weights1 = nnx.Param(
-            nnx.initializers.lecun_normal()(
-                rngs.params(), (n, hidden_dim // 2), jnp.float32
-            )
+            nnx.initializers.lecun_normal()(rngs.params(), (n, hidden_dim), jnp.float32)
         )
-        self.bias1 = nnx.Param(jnp.zeros(hidden_dim // 2))
+        self.bias1 = nnx.Param(jnp.zeros(hidden_dim))
 
-        self.weights_shortcut = nnx.Param(
-            nnx.initializers.lecun_normal()(rngs.params(), (n, k), jnp.float32)
+        self.lyr2 = nnx.Linear(hidden_dim, k, rngs=rngs)
+
+        self.scale_weights = nnx.Param(
+            1e-6 * jax.random.normal(rngs.params(), (n, 1), dtype=jnp.float32)
         )
-        self.bias_shortcut = nnx.Param(jnp.zeros(k))
-
-        self.lyr2 = nnx.Linear(hidden_dim // 2, hidden_dim, rngs=rngs)
-        self.lyr3 = nnx.Linear(hidden_dim, k, rngs=rngs)
-
-        self.ln1 = nnx.LayerNorm(hidden_dim // 2, rngs=rngs)
-
-        # Separate layer for scale prediction
-        self.scale_lyr1 = nnx.Linear(hidden_dim, 1, rngs=rngs)
+        self.scale_bias = nnx.Param(jnp.zeros(1))
 
     def __call__(self, X: jax.Array | BCSR):
-        # residual = X @ self.weights_shortcut.value + self.bias_shortcut.value
-        u = X @ self.weights1.value + self.bias1.value
-        u = self.ln1(u)
-        u = nnx.leaky_relu(u)
-        u = self.lyr2(u)
-        u = nnx.leaky_relu(u)
-        log_scale = self.scale_lyr1(u)
+        log_scale = X @ self.scale_weights.value + self.scale_bias.value
 
-        u = self.lyr3(u)
-        u = nnx.softplus(u)  # + nnx.softplus(residual)
+        h = X @ self.weights1.value + self.bias1.value
+        h = nnx.softplus(h)
+        h = self.lyr2(h)
+        u = nnx.softplus(h)
+
+        return u, log_scale
+
+
+class DeepCompactEncoder(nnx.Module):
+    """
+    Compact two-layer encoder: X -> k-dim hidden -> k output
+
+    Architecture:
+    - Input -> k (softplus) -> k (softplus)
+    - Reduced capacity vs DeepSoftplusEncoder (k vs hidden_dim)
+    - Scale predicted directly from input
+
+    Best for: Good likelihood with lower capacity, works well with regularization
+    """
+
+    def __init__(self, n: int, k: int, hidden_dim: int, *, rngs: nnx.Rngs):
+        # Use k as hidden dim instead of hidden_dim to match SimpleEncoder capacity
+        self.weights1 = nnx.Param(
+            nnx.initializers.lecun_normal()(rngs.params(), (n, k), jnp.float32)
+        )
+        self.bias1 = nnx.Param(jnp.zeros(k))
+
+        self.lyr2 = nnx.Linear(k, k, rngs=rngs)
+
+        self.scale_weights = nnx.Param(
+            1e-6 * jax.random.normal(rngs.params(), (n, 1), dtype=jnp.float32)
+        )
+        self.scale_bias = nnx.Param(jnp.zeros(1))
+
+    def __call__(self, X: jax.Array | BCSR):
+        log_scale = X @ self.scale_weights.value + self.scale_bias.value
+
+        h = X @ self.weights1.value + self.bias1.value
+        h = nnx.softplus(h)
+        h = self.lyr2(h)
+        u = nnx.softplus(h)
+
+        return u, log_scale
+
+
+class BoundedAuxiliaryEncoder(nnx.Module):
+    """
+    Direct + bounded auxiliary path encoder
+
+    Architecture:
+    - Primary: X -> linear
+    - Auxiliary: X -> linear -> tanh (bounded to [-1, 1], scaled 0.1)
+    - Combined: softplus(primary + auxiliary)
+
+    This architectural approach maintains low correlation without regularization
+    by limiting auxiliary path influence through tanh bounding.
+
+    Best for: Good likelihood + low correlation without needing regularization
+    """
+
+    def __init__(self, n: int, k: int, hidden_dim: int, *, rngs: nnx.Rngs):
+        # Primary path: direct like SimpleEncoder
+        self.weights_direct = nnx.Param(
+            nnx.initializers.lecun_normal()(rngs.params(), (n, k), jnp.float32)
+        )
+        self.bias_direct = nnx.Param(jnp.zeros(k))
+
+        # Auxiliary path for refinement (small weight 0.1)
+        self.weights_aux = nnx.Param(
+            nnx.initializers.lecun_normal()(rngs.params(), (n, k), jnp.float32) * 0.1
+        )
+        self.bias_aux = nnx.Param(jnp.zeros(k))
+
+        # Scale prediction
+        self.scale_weights = nnx.Param(
+            1e-6 * jax.random.normal(rngs.params(), (n, 1), dtype=jnp.float32)
+        )
+        self.scale_bias = nnx.Param(jnp.zeros(1))
+
+    def __call__(self, X: jax.Array | BCSR):
+        log_scale = X @ self.scale_weights.value + self.scale_bias.value
+
+        # Main direct path
+        u_direct = X @ self.weights_direct.value + self.bias_direct.value
+
+        # Auxiliary refinement
+        u_aux = X @ self.weights_aux.value + self.bias_aux.value
+        u_aux = jnp.tanh(u_aux)  # bounded correction
+
+        # Combine and apply softplus
+        u = nnx.softplus(u_direct + u_aux)
 
         return u, log_scale
 
@@ -214,13 +305,27 @@ class NMF(nnx.Module):
         r_prior_alpha: float = 2.0,
         r_prior_beta: float = 2.0,
         scale_prior_sigma: float = 0.5,
-        simple_encoder: bool = True,
+        encoder_version: str = "simple",
+        metagene_reg_type: str = "none",
+        metagene_reg_strength: float = 0.01,
     ):
         key = rngs.params()
-        if simple_encoder:
+
+        # Select encoder based on version
+        if encoder_version == "simple":
             self.encoder = SimpleEncoder(n, k, rngs=rngs)
+        elif encoder_version == "deep_softplus":
+            self.encoder = DeepSoftplusEncoder(n, k, hidden_dim=hidden_dim, rngs=rngs)
+        elif encoder_version == "deep_compact":
+            self.encoder = DeepCompactEncoder(n, k, hidden_dim=hidden_dim, rngs=rngs)
+        elif encoder_version == "bounded_auxiliary":
+            self.encoder = BoundedAuxiliaryEncoder(n, k, hidden_dim=hidden_dim, rngs=rngs)
         else:
-            self.encoder = Encoder(n, k, hidden_dim=hidden_dim, rngs=rngs)
+            raise ValueError(
+                f"Unknown encoder_version: {encoder_version}. "
+                f"Must be one of: 'simple', 'deep_softplus', 'deep_compact', 'bounded_auxiliary'"
+            )
+
         self.v = nnx.Param(jax.random.normal(key, (k, n)) / jnp.sqrt(n))
         self.log_r = nnx.Param(jnp.full(n, 1e-1))
 
@@ -228,6 +333,8 @@ class NMF(nnx.Module):
         self.r_prior_alpha = r_prior_alpha
         self.r_prior_beta = r_prior_beta
         self.scale_prior_sigma = scale_prior_sigma
+        self.metagene_reg_type = metagene_reg_type
+        self.metagene_reg_strength = metagene_reg_strength
 
     # X: [batch_size, n]
     def __call__(self, X: jax.Array | BCSR) -> jax.Array:
@@ -252,6 +359,63 @@ class NMF(nnx.Module):
     def r(self) -> jax.Array:
         return jnp.exp(self.log_r.value)
 
+    def metagene_regularization(self) -> jax.Array:
+        """
+        Compute regularization term to encourage diverse/orthogonal metagenes.
+
+        Returns penalty term (to be minimized).
+        """
+        if self.metagene_reg_type == "none":
+            return 0.0
+
+        # Get normalized V matrix (k x n), each row is a metagene
+        v_norm = self.v_norm()  # [k, n]
+
+        if self.metagene_reg_type == "correlation":
+            # Penalize correlation between metagene rows
+            # Compute correlation matrix: corr[i,j] = correlation between metagene i and j
+            # First center each row
+            v_centered = v_norm - jnp.mean(v_norm, axis=1, keepdims=True)
+            # Compute row norms
+            row_norms = jnp.sqrt(jnp.sum(v_centered**2, axis=1, keepdims=True))
+            # Normalize
+            v_normalized = v_centered / (row_norms + 1e-8)
+            # Compute correlation matrix
+            corr_matrix = v_normalized @ v_normalized.T  # [k, k]
+            # Penalize off-diagonal elements (we want them near 0)
+            # Extract off-diagonal using mask
+            k = corr_matrix.shape[0]
+            mask = 1.0 - jnp.eye(k)
+            off_diag_corr = corr_matrix * mask
+            penalty = jnp.sum(off_diag_corr**2)
+            return self.metagene_reg_strength * penalty
+
+        elif self.metagene_reg_type == "orthogonal":
+            # Penalize V @ V^T being far from identity
+            # V is [k, n], so V @ V^T is [k, k]
+            gram = v_norm @ v_norm.T  # [k, k]
+            k = gram.shape[0]
+            identity = jnp.eye(k)
+            penalty = jnp.sum((gram - identity) ** 2)
+            return self.metagene_reg_strength * penalty
+
+        elif self.metagene_reg_type == "cosine":
+            # Penalize cosine similarity between metagene pairs
+            # Normalize rows to unit length
+            row_norms = jnp.sqrt(jnp.sum(v_norm**2, axis=1, keepdims=True))
+            v_unit = v_norm / (row_norms + 1e-8)
+            # Compute cosine similarity matrix
+            cosine_sim = v_unit @ v_unit.T  # [k, k]
+            # Penalize off-diagonal (want low similarity)
+            k = cosine_sim.shape[0]
+            mask = 1.0 - jnp.eye(k)
+            off_diag_sim = cosine_sim * mask
+            penalty = jnp.sum(off_diag_sim**2)
+            return self.metagene_reg_strength * penalty
+
+        else:
+            return 0.0
+
     def log_prior(self, log_scale: jax.Array) -> jax.Array:
         """
         Compute log prior for all parameters.
@@ -259,6 +423,7 @@ class NMF(nnx.Module):
         Currently implements:
         - Gamma(alpha, beta) prior on dispersion parameters r
         - Normal(0, sigma) prior on scale_logit (cell-specific scale factors)
+        - Optional metagene regularization (correlation, orthogonal, or cosine)
 
         Args:
             scale_logit: [batch_size] array of scale logit values for current batch
@@ -288,6 +453,9 @@ class NMF(nnx.Module):
         )
 
         neg_log_prior += -jnp.sum(log_prior_scale)
+
+        # Add metagene regularization
+        neg_log_prior += self.metagene_regularization()
 
         return neg_log_prior
 
@@ -458,7 +626,9 @@ def nmf(
     r_prior_alpha: float = 2.0,
     r_prior_beta: float = 2.0,
     scale_prior_sigma: float = 0.1,
-    simple_encoder: bool = True,
+    encoder_version: str = "simple",
+    metagene_reg_type: str = "none",
+    metagene_reg_strength: float = 0.01,
     quiet: bool = False,
 ):
     """
@@ -557,7 +727,9 @@ def nmf(
         r_prior_alpha=r_prior_alpha,
         r_prior_beta=r_prior_beta,
         scale_prior_sigma=scale_prior_sigma,
-        simple_encoder=simple_encoder,
+        encoder_version=encoder_version,
+        metagene_reg_type=metagene_reg_type,
+        metagene_reg_strength=metagene_reg_strength,
     )
 
     optimizer = nnx.Optimizer(model, optax.adam(lr))
