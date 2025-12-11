@@ -308,6 +308,7 @@ class NMF(nnx.Module):
         encoder_version: str = "simple",
         metagene_reg_type: str = "none",
         metagene_reg_strength: float = 0.01,
+        gene_scaled_factors: bool = False,
     ):
         key = rngs.params()
 
@@ -319,7 +320,9 @@ class NMF(nnx.Module):
         elif encoder_version == "deep_compact":
             self.encoder = DeepCompactEncoder(n, k, hidden_dim=hidden_dim, rngs=rngs)
         elif encoder_version == "bounded_auxiliary":
-            self.encoder = BoundedAuxiliaryEncoder(n, k, hidden_dim=hidden_dim, rngs=rngs)
+            self.encoder = BoundedAuxiliaryEncoder(
+                n, k, hidden_dim=hidden_dim, rngs=rngs
+            )
         else:
             raise ValueError(
                 f"Unknown encoder_version: {encoder_version}. "
@@ -335,6 +338,7 @@ class NMF(nnx.Module):
         self.scale_prior_sigma = scale_prior_sigma
         self.metagene_reg_type = metagene_reg_type
         self.metagene_reg_strength = metagene_reg_strength
+        self.gene_scaled_factors = gene_scaled_factors
 
     # X: [batch_size, n]
     def __call__(self, X: jax.Array | BCSR) -> jax.Array:
@@ -345,10 +349,13 @@ class NMF(nnx.Module):
 
         lambda_base = u @ self.v_scaled()  # [batch_size, n]
         # Scale each cell's predictions by its scale factor
-        lambda_scaled = lambda_base * scale  # [batch_size, n]
-        # lambda_scaled = lambda_base
 
-        return lambda_scaled, scale
+        if self.gene_scaled_factors:
+            lambda_scaled = lambda_base * scale  # [batch_size, n]
+        else:
+            lambda_scaled = lambda_base
+
+        return lambda_scaled, u, scale
 
     def v_norm(self) -> jax.Array:
         return nnx.softmax(self.v.value, axis=1)
@@ -416,7 +423,7 @@ class NMF(nnx.Module):
         else:
             return 0.0
 
-    def log_prior(self, log_scale: jax.Array) -> jax.Array:
+    def log_prior(self, u: jax.Array, log_scale: jax.Array) -> jax.Array:
         """
         Compute log prior for all parameters.
 
@@ -454,15 +461,23 @@ class NMF(nnx.Module):
 
         neg_log_prior += -jnp.sum(log_prior_scale)
 
-        # Add metagene regularization
+        # Add metagene regularization (inducing sparsity or orthogonality)
         neg_log_prior += self.metagene_regularization()
+
+        # TODO: A possible regularization: metagene usage entropy
+        # # metagene usage entropy penality (we want to induce larger entropy so that metagenes are actually used)
+        # u_mean = np.mean(u, axis=0)  # mean metagene expression [k]
+        # usage = u_mean / np.sum(u_mean)
+
+        # c = 100.0
+        # neg_log_prior += -c * jnp.sum(jax.scipy.special.entr(usage))
 
         return neg_log_prior
 
 
 def neg_poisson_logprob_dense(model: NMF, X: jax.Array, constant_terms: bool = False):
     """Negative log probability for dense input."""
-    λ, log_scale = model(X)
+    λ, u, log_scale = model(X)
     lp = (X * jnp.log(jnp.clip(λ, 1e-8))).sum() - jnp.sum(λ)
 
     # constant wrt to parameters
@@ -472,14 +487,14 @@ def neg_poisson_logprob_dense(model: NMF, X: jax.Array, constant_terms: bool = F
     neg_log_likelihood = -lp
 
     # Add negative log prior (for MAP estimation)
-    neg_log_posterior = neg_log_likelihood + model.log_prior(log_scale)
+    neg_log_posterior = neg_log_likelihood + model.log_prior(u, log_scale)
 
     return neg_log_posterior
 
 
 def neg_poisson_logprob_sparse(model: NMF, X: BCSR, constant_terms: bool = False):
     """Negative log probability for sparse BCSR input."""
-    λ, log_scale = model(X)
+    λ, u, log_scale = model(X)
     # Extract λ values only at non-zero positions of X
     lp = (
         X.data * jnp.log(jnp.clip(bcsr_extract(X.indices, X.indptr, λ), 1e-8))
@@ -492,13 +507,13 @@ def neg_poisson_logprob_sparse(model: NMF, X: BCSR, constant_terms: bool = False
     neg_log_likelihood = -lp
 
     # Add negative log prior (for MAP estimation)
-    neg_log_posterior = neg_log_likelihood + model.log_prior(log_scale)
+    neg_log_posterior = neg_log_likelihood + model.log_prior(u, log_scale)
 
     return neg_log_posterior
 
 
 def neg_nb_logprob_dense(model: NMF, X: jax.Array, constant_terms: bool = False):
-    λ, log_scale = model(X)  # [ncells, ngenes], [ncells]
+    λ, u, log_scale = model(X)  # [ncells, ngenes], [ncells]
     r = jnp.expand_dims(model.r(), 0)  # [1, ngenes]
     log_r = jnp.expand_dims(model.log_r.value, 0)  # [1, ngenes]
     log_λr = jnp.log(λ + r)  # [ncells, ngenes]
@@ -522,13 +537,13 @@ def neg_nb_logprob_dense(model: NMF, X: jax.Array, constant_terms: bool = False)
     neg_log_likelihood = -lp
 
     # Add negative log prior (for MAP estimation)
-    neg_log_posterior = neg_log_likelihood + model.log_prior(log_scale)
+    neg_log_posterior = neg_log_likelihood + model.log_prior(u, log_scale)
 
     return neg_log_posterior
 
 
 def neg_nb_logprob_sparse(model: NMF, X: BCSR, constant_terms: bool = False):
-    λ, log_scale = model(X)  # [ncells, ngenes], [ncells]
+    λ, u, log_scale = model(X)  # [ncells, ngenes], [ncells]
     r = jnp.expand_dims(model.r(), 0)  # [1, ngenes]
     log_r = jnp.expand_dims(model.log_r.value, 0)  # [1, ngenes]
     log_λr = jnp.log(λ + r)  # [ncells, ngenes]
@@ -565,7 +580,7 @@ def neg_nb_logprob_sparse(model: NMF, X: BCSR, constant_terms: bool = False):
     neg_log_likelihood = -lp
 
     # Add negative log prior (for MAP estimation)
-    neg_log_posterior = neg_log_likelihood + model.log_prior(log_scale)
+    neg_log_posterior = neg_log_likelihood + model.log_prior(u, log_scale)
 
     return neg_log_posterior
 
@@ -629,6 +644,7 @@ def nmf(
     encoder_version: str = "simple",
     metagene_reg_type: str = "none",
     metagene_reg_strength: float = 0.01,
+    gene_scaled_factors: bool = False,
     quiet: bool = False,
 ):
     """
@@ -730,6 +746,7 @@ def nmf(
         encoder_version=encoder_version,
         metagene_reg_type=metagene_reg_type,
         metagene_reg_strength=metagene_reg_strength,
+        gene_scaled_factors=gene_scaled_factors,
     )
 
     optimizer = nnx.Optimizer(model, optax.adam(lr))
