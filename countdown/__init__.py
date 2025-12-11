@@ -366,9 +366,12 @@ class NMF(nnx.Module):
     def r(self) -> jax.Array:
         return jnp.exp(self.log_r.value)
 
-    def metagene_regularization(self) -> jax.Array:
+    def metagene_regularization(self, u: jax.Array) -> jax.Array:
         """
         Compute regularization term to encourage diverse/orthogonal metagenes.
+
+        Args:
+            u: [batch_size, k] metagene usage matrix from current batch
 
         Returns penalty term (to be minimized).
         """
@@ -420,6 +423,77 @@ class NMF(nnx.Module):
             penalty = jnp.sum(off_diag_sim**2)
             return self.metagene_reg_strength * penalty
 
+        elif self.metagene_reg_type == "entropy":
+            # Encourage even usage of metagenes across cells
+            # Compute mean usage per metagene across this batch
+            u_mean = jnp.mean(u, axis=0)  # [k]
+            # Normalize to sum to 1
+            u_prob = u_mean / (jnp.sum(u_mean) + 1e-8)
+            # Compute entropy (higher = more even usage)
+            entropy = -jnp.sum(u_prob * jnp.log(u_prob + 1e-8))
+            # Penalize low entropy (we want to maximize entropy, so minimize negative)
+            max_entropy = jnp.log(float(u.shape[1]))  # log(k)
+            penalty = max_entropy - entropy
+            return self.metagene_reg_strength * penalty
+
+        elif self.metagene_reg_type == "usage":
+            # Penalize unused metagenes
+            # Count which metagenes are active (>threshold) in this batch
+            threshold = 0.1
+            active = jnp.mean(u > threshold, axis=0)  # [k] - fraction of cells using each metagene
+            # Penalize metagenes with low usage
+            penalty = jnp.sum(jnp.maximum(0.01 - active, 0.0))  # Penalize if <1% usage
+            return self.metagene_reg_strength * penalty
+
+        elif self.metagene_reg_type == "weighted_correlation":
+            # Weight correlation by gene variance to focus on expressed genes
+            # This addresses the "useless orthogonal metagenes" problem
+
+            # Compute gene weights from V (high variance in V = important gene)
+            gene_variance = jnp.var(v_norm, axis=0)  # [n]
+            gene_weights = gene_variance / (jnp.sum(gene_variance) + 1e-8)
+
+            # Weight each gene's contribution to correlation
+            v_weighted = v_norm * jnp.sqrt(gene_weights)  # Weight before correlation
+
+            # Compute correlation on weighted V
+            v_centered = v_weighted - jnp.mean(v_weighted, axis=1, keepdims=True)
+            row_norms = jnp.sqrt(jnp.sum(v_centered**2, axis=1, keepdims=True))
+            v_normalized = v_centered / (row_norms + 1e-8)
+            corr_matrix = v_normalized @ v_normalized.T
+
+            # Penalize off-diagonal
+            k = corr_matrix.shape[0]
+            mask = 1.0 - jnp.eye(k)
+            penalty = jnp.sum((corr_matrix * mask)**2)
+            return self.metagene_reg_strength * penalty
+
+        elif self.metagene_reg_type == "combined":
+            # Combine weighted correlation + entropy regularization
+            # This should give decorrelated metagenes that are actually used
+
+            # 1. Weighted correlation (focus on expressed genes)
+            gene_variance = jnp.var(v_norm, axis=0)
+            gene_weights = gene_variance / (jnp.sum(gene_variance) + 1e-8)
+            v_weighted = v_norm * jnp.sqrt(gene_weights)
+            v_centered = v_weighted - jnp.mean(v_weighted, axis=1, keepdims=True)
+            row_norms = jnp.sqrt(jnp.sum(v_centered**2, axis=1, keepdims=True))
+            v_normalized = v_centered / (row_norms + 1e-8)
+            corr_matrix = v_normalized @ v_normalized.T
+            k = corr_matrix.shape[0]
+            mask = 1.0 - jnp.eye(k)
+            corr_penalty = jnp.sum((corr_matrix * mask)**2)
+
+            # 2. Entropy (encourage even usage)
+            u_mean = jnp.mean(u, axis=0)
+            u_prob = u_mean / (jnp.sum(u_mean) + 1e-8)
+            entropy = -jnp.sum(u_prob * jnp.log(u_prob + 1e-8))
+            max_entropy = jnp.log(float(u.shape[1]))
+            entropy_penalty = max_entropy - entropy
+
+            # Combine with equal weight
+            return self.metagene_reg_strength * (corr_penalty + entropy_penalty)
+
         else:
             return 0.0
 
@@ -461,13 +535,9 @@ class NMF(nnx.Module):
 
         neg_log_prior += -jnp.sum(log_prior_scale)
 
-        # Add metagene regularization (inducing sparsity or orthogonality)
-        neg_log_prior += self.metagene_regularization()
-
-        # TODO: A possible regularization: metagene usage entropy
-        # # metagene usage entropy penality (we want to induce larger entropy so that metagenes are actually used)
-        # u_mean = np.mean(u, axis=0)  # mean metagene expression [k]
-        # usage = u_mean / np.sum(u_mean)
+        # Add metagene regularization (pass u for usage-based penalties)
+        # Now supports entropy, usage, weighted_correlation, and combined modes
+        neg_log_prior += self.metagene_regularization(u)
 
         # c = 100.0
         # neg_log_prior += -c * jnp.sum(jax.scipy.special.entr(usage))
