@@ -736,6 +736,8 @@ def nmf(
     metagene_reg_strength: float = 0.01,
     gene_scale_factors: bool = False,
     quiet: bool = False,
+    filter_min_prop: float = 1e-5,
+    filter_min_delta: float = 1.0,
 ):
     """
     Perform Non-negative Matrix Factorization (NMF) on genomic count data.
@@ -794,9 +796,13 @@ def nmf(
     Results are stored in the AnnData object as:
 
     - `adata.obsm["X_nmf"]` : ndarray of shape (n_observations, k)
-        The low-dimensional NMF representation of the observations.
-        Each row corresponds to an observation (cell) and each column
-        to a latent factor.
+        The full low-dimensional NMF representation of the observations.
+    - `adata.obsm["X_nmf_filtered"]` : ndarray of shape (n_observations, k_filtered)
+        The filtered NMF representation, removing dimensions with low expression.
+    - `adata.varm["V_nmf"]` : ndarray of shape (n_features, k)
+        The full factor matrix.
+    - `adata.varm["V_nmf_filtered"]` : ndarray of shape (n_features, k_filtered)
+        The filtered factor matrix.
 
     The method supports both sparse (CSR) and dense numpy arrays as input
     and automatically handles batching for memory efficiency with large datasets.
@@ -933,3 +939,19 @@ def nmf(
     adata.obs["scale_nmf"] = scales
     adata.varm["V_nmf"] = np.asarray(model.v_norm()).transpose()
     adata.uns["nmf_log_likelihood"] = float(ll)
+
+    # Filter irrelevant metagenes
+    if filter_min_prop > 0:
+        prop_expressed = np.mean(Xnmf > filter_min_delta, axis=0)
+        keep = prop_expressed >= filter_min_prop
+
+        if not quiet and np.sum(~keep) > 0:
+            print(
+                f"Filtered {np.sum(~keep)}/{k} metagenes (prop < {filter_min_prop}, delta > {filter_min_delta})"
+            )
+
+        adata.obsm["X_nmf_filtered"] = Xnmf[:, keep]
+        adata.varm["V_nmf_filtered"] = adata.varm["V_nmf"][:, keep]
+    else:
+        adata.obsm["X_nmf_filtered"] = adata.obsm["X_nmf"]
+        adata.varm["V_nmf_filtered"] = adata.varm["V_nmf"]
