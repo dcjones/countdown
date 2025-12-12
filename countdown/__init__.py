@@ -156,18 +156,9 @@ class SimpleEncoder(nnx.Module):
         )
         self.bias = nnx.Param(jnp.zeros(k))
 
-        # Separate layer for log-scale prediction
-        # Initialize with small weights so log_scale starts near 0 (scale near 1)
-        self.scale_weights = nnx.Param(
-            1e-6 * jax.random.normal(rngs.params(), (n, 1), dtype=jnp.float32)
-        )
-        self.scale_bias = nnx.Param(jnp.zeros(1))
-
     def __call__(self, X: jax.Array | BCSR):
         u = nnx.softplus(X @ self.weights.value + self.bias.value)
-
-        log_scale = X @ self.scale_weights.value + self.scale_bias.value
-        return u, log_scale
+        return u
 
 
 class DeepSoftplusEncoder(nnx.Module):
@@ -191,20 +182,13 @@ class DeepSoftplusEncoder(nnx.Module):
 
         self.lyr2 = nnx.Linear(hidden_dim, k, rngs=rngs)
 
-        self.scale_weights = nnx.Param(
-            1e-6 * jax.random.normal(rngs.params(), (n, 1), dtype=jnp.float32)
-        )
-        self.scale_bias = nnx.Param(jnp.zeros(1))
-
     def __call__(self, X: jax.Array | BCSR):
-        log_scale = X @ self.scale_weights.value + self.scale_bias.value
-
         h = X @ self.weights1.value + self.bias1.value
         h = nnx.softplus(h)
         h = self.lyr2(h)
         u = nnx.softplus(h)
 
-        return u, log_scale
+        return u
 
 
 class DeepCompactEncoder(nnx.Module):
@@ -228,20 +212,13 @@ class DeepCompactEncoder(nnx.Module):
 
         self.lyr2 = nnx.Linear(k, k, rngs=rngs)
 
-        self.scale_weights = nnx.Param(
-            1e-6 * jax.random.normal(rngs.params(), (n, 1), dtype=jnp.float32)
-        )
-        self.scale_bias = nnx.Param(jnp.zeros(1))
-
     def __call__(self, X: jax.Array | BCSR):
-        log_scale = X @ self.scale_weights.value + self.scale_bias.value
-
         h = X @ self.weights1.value + self.bias1.value
         h = nnx.softplus(h)
         h = self.lyr2(h)
         u = nnx.softplus(h)
 
-        return u, log_scale
+        return u
 
 
 class BoundedAuxiliaryEncoder(nnx.Module):
@@ -272,15 +249,7 @@ class BoundedAuxiliaryEncoder(nnx.Module):
         )
         self.bias_aux = nnx.Param(jnp.zeros(k))
 
-        # Scale prediction
-        self.scale_weights = nnx.Param(
-            1e-6 * jax.random.normal(rngs.params(), (n, 1), dtype=jnp.float32)
-        )
-        self.scale_bias = nnx.Param(jnp.zeros(1))
-
     def __call__(self, X: jax.Array | BCSR):
-        log_scale = X @ self.scale_weights.value + self.scale_bias.value
-
         # Main direct path
         u_direct = X @ self.weights_direct.value + self.bias_direct.value
 
@@ -291,7 +260,44 @@ class BoundedAuxiliaryEncoder(nnx.Module):
         # Combine and apply softplus
         u = nnx.softplus(u_direct + u_aux)
 
-        return u, log_scale
+        return u
+
+
+class ScaleEncoder(nnx.Module):
+    """
+    Simple MLP encoder for predicting cell-specific scale factors.
+
+    Architecture:
+    - Input (n genes) -> hidden layer (16 units) -> softplus -> output (1 scale)
+    - Small hidden layer (16) for stability with high-dimensional sparse input
+    - Predicts log_scale which is clipped and exponentiated
+
+    Trained separately from main encoder to provide stable scale predictions.
+    """
+
+    def __init__(self, n: int, *, rngs: nnx.Rngs):
+        # Small hidden layer for stability
+        hidden_dim = 32
+
+        self.weights1 = nnx.Param(
+            1e-3 * jax.random.normal(rngs.params(), (n, hidden_dim), dtype=jnp.float32)
+        )
+        self.bias1 = nnx.Param(jnp.zeros(hidden_dim))
+
+        self.weights2 = nnx.Param(
+            1e-3 * jax.random.normal(rngs.params(), (hidden_dim, 1), dtype=jnp.float32)
+        )
+        self.bias2 = nnx.Param(jnp.zeros(1))
+
+    def __call__(self, X: jax.Array | BCSR):
+        # Hidden layer with softplus activation
+        h = X @ self.weights1.value + self.bias1.value
+        h = nnx.softplus(h)
+
+        # Output layer (log_scale)
+        log_scale = h @ self.weights2.value + self.bias2.value
+
+        return log_scale
 
 
 class NMF(nnx.Module):
@@ -308,7 +314,7 @@ class NMF(nnx.Module):
         encoder_version: str = "simple",
         metagene_reg_type: str = "none",
         metagene_reg_strength: float = 0.01,
-        gene_scaled_factors: bool = False,
+        gene_scale_factors: bool = False,
     ):
         key = rngs.params()
 
@@ -332,30 +338,42 @@ class NMF(nnx.Module):
         self.v = nnx.Param(jax.random.normal(key, (k, n)) / jnp.sqrt(n))
         self.log_r = nnx.Param(jnp.full(n, 1e-1))
 
+        # Separate scale encoder - simple MLP for predicting cell-specific scales
+        self.scale_encoder = ScaleEncoder(n, rngs=rngs)
+
         # Store prior hyperparameters (not trainable)
         self.r_prior_alpha = r_prior_alpha
         self.r_prior_beta = r_prior_beta
         self.scale_prior_sigma = scale_prior_sigma
         self.metagene_reg_type = metagene_reg_type
         self.metagene_reg_strength = metagene_reg_strength
-        self.gene_scaled_factors = gene_scaled_factors
+        self.gene_scale_factors = gene_scale_factors
 
     # X: [batch_size, n]
     def __call__(self, X: jax.Array | BCSR) -> jax.Array:
-        u, log_scale = self.encoder(X)
-        scale = jnp.exp(log_scale)  # [batch_size]
+        u = self.encoder(X)  # [batch_size, k]
 
+        # Predict log_scale using separate scale encoder
+        log_scale = self.scale_encoder(X)  # [batch_size, 1]
+
+        # Clip log_scale to prevent overflow in exp()
+        # Allows scales from exp(-10) ≈ 0.000045 to exp(10) ≈ 22026
+        log_scale = jnp.clip(log_scale, -10.0, 10.0)
+
+        scale = jnp.exp(log_scale)  # [batch_size, 1]
+
+        # jax.debug.print("mean scale: {}", jnp.mean(scale))
         # jax.debug.print("scale: [{}, {}]", jnp.min(scale), jnp.max(scale))
 
         lambda_base = u @ self.v_scaled()  # [batch_size, n]
         # Scale each cell's predictions by its scale factor
 
-        if self.gene_scaled_factors:
+        if self.gene_scale_factors:
             lambda_scaled = lambda_base * scale  # [batch_size, n]
         else:
             lambda_scaled = lambda_base
 
-        return lambda_scaled, u, scale
+        return lambda_scaled, u, log_scale
 
     def v_norm(self) -> jax.Array:
         return nnx.softmax(self.v.value, axis=1)
@@ -440,7 +458,9 @@ class NMF(nnx.Module):
             # Penalize unused metagenes
             # Count which metagenes are active (>threshold) in this batch
             threshold = 0.1
-            active = jnp.mean(u > threshold, axis=0)  # [k] - fraction of cells using each metagene
+            active = jnp.mean(
+                u > threshold, axis=0
+            )  # [k] - fraction of cells using each metagene
             # Penalize metagenes with low usage
             penalty = jnp.sum(jnp.maximum(0.01 - active, 0.0))  # Penalize if <1% usage
             return self.metagene_reg_strength * penalty
@@ -465,7 +485,7 @@ class NMF(nnx.Module):
             # Penalize off-diagonal
             k = corr_matrix.shape[0]
             mask = 1.0 - jnp.eye(k)
-            penalty = jnp.sum((corr_matrix * mask)**2)
+            penalty = jnp.sum((corr_matrix * mask) ** 2)
             return self.metagene_reg_strength * penalty
 
         elif self.metagene_reg_type == "combined":
@@ -482,7 +502,7 @@ class NMF(nnx.Module):
             corr_matrix = v_normalized @ v_normalized.T
             k = corr_matrix.shape[0]
             mask = 1.0 - jnp.eye(k)
-            corr_penalty = jnp.sum((corr_matrix * mask)**2)
+            corr_penalty = jnp.sum((corr_matrix * mask) ** 2)
 
             # 2. Entropy (encourage even usage)
             u_mean = jnp.mean(u, axis=0)
@@ -714,7 +734,7 @@ def nmf(
     encoder_version: str = "simple",
     metagene_reg_type: str = "none",
     metagene_reg_strength: float = 0.01,
-    gene_scaled_factors: bool = False,
+    gene_scale_factors: bool = False,
     quiet: bool = False,
 ):
     """
@@ -816,7 +836,7 @@ def nmf(
         encoder_version=encoder_version,
         metagene_reg_type=metagene_reg_type,
         metagene_reg_strength=metagene_reg_strength,
-        gene_scaled_factors=gene_scaled_factors,
+        gene_scale_factors=gene_scale_factors,
     )
 
     optimizer = nnx.Optimizer(model, optax.adam(lr))
@@ -842,6 +862,9 @@ def nmf(
                 metrics.update(neg_logprob=loss)
 
             logprob = -metrics.compute()["neg_logprob"]
+
+            if not np.isfinite(logprob):
+                raise ValueError("Log-likelihood is not finite")
 
             # Check for improvement
             if logprob - best_logprob > min_delta:
@@ -890,7 +913,13 @@ def nmf(
 
         X_chunk = as_dense_f32(X[start_idx:end_idx, :])
         X_chunk = jnp.array(X_chunk, dtype=jnp.float32)
-        encoded_chunk, log_scale_chunk = model.encoder(X_chunk)
+
+        # Get encoded representation
+        encoded_chunk = model.encoder(X_chunk)
+
+        # Predict log_scale using scale encoder (same as in model.__call__)
+        log_scale_chunk = model.scale_encoder(X_chunk)
+        log_scale_chunk = jnp.clip(log_scale_chunk, -10.0, 10.0)
 
         ll += -final_loss_fn(model, X_chunk, constant_terms=True)
 
@@ -903,5 +932,4 @@ def nmf(
     adata.obsm["X_nmf"] = Xnmf
     adata.obs["scale_nmf"] = scales
     adata.varm["V_nmf"] = np.asarray(model.v_norm()).transpose()
-    # adata.varm["scale_nmf"] = np.asarray(model.scale.value).squeeze()
     adata.uns["nmf_log_likelihood"] = float(ll)
