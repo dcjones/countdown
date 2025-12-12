@@ -9,6 +9,7 @@ from flax import nnx
 from jax._src.dtypes import JAXType
 from jax.experimental.sparse import BCSR, bcsr_extract
 from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import svds
 from tqdm import tqdm
 
 
@@ -315,6 +316,8 @@ class NMF(nnx.Module):
         metagene_reg_type: str = "none",
         metagene_reg_strength: float = 0.01,
         gene_scale_factors: bool = False,
+        init_method: str = "normal",
+        v_init: jax.Array | None = None,
     ):
         key = rngs.params()
 
@@ -335,7 +338,25 @@ class NMF(nnx.Module):
                 f"Must be one of: 'simple', 'deep_softplus', 'deep_compact', 'bounded_auxiliary'"
             )
 
-        self.v = nnx.Param(jax.random.normal(key, (k, n)) / jnp.sqrt(n))
+        if v_init is not None:
+            self.v = nnx.Param(v_init)
+        elif init_method == "normal":
+            self.v = nnx.Param(jax.random.normal(key, (k, n)) / jnp.sqrt(n))
+        elif init_method == "uniform":
+            self.v = nnx.Param(
+                jax.random.uniform(key, (k, n), minval=-1.0, maxval=1.0) / jnp.sqrt(n)
+            )
+        elif init_method == "kaiming":
+            self.v = nnx.Param(nnx.initializers.he_normal()(key, (k, n), jnp.float32))
+        elif init_method == "xavier":
+            self.v = nnx.Param(
+                nnx.initializers.xavier_normal()(key, (k, n), jnp.float32)
+            )
+        elif init_method == "orthogonal":
+            self.v = nnx.Param(nnx.initializers.orthogonal()(key, (k, n), jnp.float32))
+        else:
+            raise ValueError(f"Unknown init_method: {init_method}")
+
         self.log_r = nnx.Param(jnp.full(n, 1e-1))
 
         # Separate scale encoder - simple MLP for predicting cell-specific scales
@@ -458,8 +479,10 @@ class NMF(nnx.Module):
             # Penalize unused metagenes
             # Count which metagenes are active (>threshold) in this batch
             threshold = 0.1
+            # Use sigmoid for differentiable approximation of indicator function (u > threshold)
+            # steepness=100 makes transition sharp enough to avoid false positives for zero inputs
             active = jnp.mean(
-                u > threshold, axis=0
+                jax.nn.sigmoid(100.0 * (u - threshold)), axis=0
             )  # [k] - fraction of cells using each metagene
             # Penalize metagenes with low usage
             penalty = jnp.sum(jnp.maximum(0.01 - active, 0.0))  # Penalize if <1% usage
@@ -513,6 +536,33 @@ class NMF(nnx.Module):
 
             # Combine with equal weight
             return self.metagene_reg_strength * (corr_penalty + entropy_penalty)
+
+        elif self.metagene_reg_type == "balanced":
+            # Like combined, but weighs entropy significantly higher to force usage
+
+            # 1. Weighted correlation
+            gene_variance = jnp.var(v_norm, axis=0)
+            gene_weights = gene_variance / (jnp.sum(gene_variance) + 1e-8)
+            v_weighted = v_norm * jnp.sqrt(gene_weights)
+            v_centered = v_weighted - jnp.mean(v_weighted, axis=1, keepdims=True)
+            row_norms = jnp.sqrt(jnp.sum(v_centered**2, axis=1, keepdims=True))
+            v_normalized = v_centered / (row_norms + 1e-8)
+            corr_matrix = v_normalized @ v_normalized.T
+            k = corr_matrix.shape[0]
+            mask = 1.0 - jnp.eye(k)
+            corr_penalty = jnp.sum((corr_matrix * mask) ** 2)
+
+            # 2. Entropy
+            u_mean = jnp.mean(u, axis=0)
+            u_prob = u_mean / (jnp.sum(u_mean) + 1e-8)
+            entropy = -jnp.sum(u_prob * jnp.log(u_prob + 1e-8))
+            max_entropy = jnp.log(float(u.shape[1]))
+            entropy_penalty = max_entropy - entropy
+
+            # Higher weight on entropy (1,000,000x)
+            return self.metagene_reg_strength * (
+                corr_penalty + 1000000.0 * entropy_penalty
+            )
 
         else:
             return 0.0
@@ -731,10 +781,13 @@ def nmf(
     r_prior_alpha: float = 2.0,
     r_prior_beta: float = 2.0,
     scale_prior_sigma: float = 0.1,
-    encoder_version: str = "simple",
+    encoder_version: str = "bounded_auxiliary",
     metagene_reg_type: str = "none",
     metagene_reg_strength: float = 0.01,
-    gene_scale_factors: bool = False,
+    gene_scale_factors: bool = True,
+    init_method: str = "nndsvd",
+    init_ncells: int = 10000,
+    optimizer_name: str = "adam",
     quiet: bool = False,
     filter_min_prop: float = 1e-5,
     filter_min_delta: float = 1.0,
@@ -785,6 +838,10 @@ def nmf(
         Standard deviation for the Normal(0, sigma) prior on log scale values.
         Cell-specific scale factors are learned by the encoder using exp transformation.
         Smaller sigma values enforce stronger regularization towards uniform scaling across cells.
+    init_ncells : int, default=100000
+        Maximum number of cells to use for NNDSVD initialization. If the number of
+        cells in the dataset exceeds this value, a random subset is used to compute
+        the initialization, which speeds up startup time for large datasets.
 
     Returns
     -------
@@ -830,6 +887,58 @@ def nmf(
     if batch_size is None:
         batch_size = m
 
+    v_init = None
+    if init_method == "nndsvd":
+        if not quiet:
+            print("Computing NNDSVD initialization...")
+
+        # Subsample if dataset is too large
+        X_init = adata.X
+        if m > init_ncells:
+            if not quiet:
+                print(f"Subsampling {init_ncells} cells for initialization...")
+            # Use fixed seed for reproducibility of initialization subset
+            rng = np.random.default_rng(42)
+            indices = rng.choice(m, init_ncells, replace=False)
+            indices.sort()
+            X_init = X_init[indices]
+
+        # Compute SVD
+        U, S, Vt = svds(X_init, k=k)
+        # Sort by singular values descending
+        idx = np.argsort(S)[::-1]
+        S = S[idx]
+        U = U[:, idx]
+        Vt = Vt[idx, :]
+
+        # NNDSVD initialization for H (which becomes V in our model)
+        H = np.zeros((k, n))
+        for j in range(k):
+            x = U[:, j]
+            y = Vt[j, :]
+            xp = np.maximum(x, 0)
+            xn = np.abs(np.minimum(x, 0))
+            yp = np.maximum(y, 0)
+            yn = np.abs(np.minimum(y, 0))
+            xpn = np.linalg.norm(xp)
+            xnn = np.linalg.norm(xn)
+            ypn = np.linalg.norm(yp)
+            ynn = np.linalg.norm(yn)
+            mp = xpn * ypn
+            mn = xnn * ynn
+            if mp > mn:
+                v = yp * xpn * np.sqrt(S[j])
+            else:
+                v = yn * xnn * np.sqrt(S[j])
+            H[j, :] = v
+
+        # Add small epsilon to avoid log(0) and zeros
+        H = H + 1e-6
+        # Normalize rows to sum to 1 to match softmax expectation
+        H_norm = H / H.sum(axis=1, keepdims=True)
+        # Inverse softmax (approximate) - just use log probabilities
+        v_init = jnp.array(np.log(H_norm))
+
     rngs = nnx.Rngs(0)
     model = NMF(
         n,
@@ -843,9 +952,22 @@ def nmf(
         metagene_reg_type=metagene_reg_type,
         metagene_reg_strength=metagene_reg_strength,
         gene_scale_factors=gene_scale_factors,
+        init_method=init_method,
+        v_init=v_init,
     )
 
-    optimizer = nnx.Optimizer(model, optax.adam(lr))
+    if optimizer_name == "adam":
+        opt = optax.adam(lr)
+    elif optimizer_name == "adamw":
+        opt = optax.adamw(lr)
+    elif optimizer_name == "sgd":
+        opt = optax.sgd(lr, momentum=0.9)
+    elif optimizer_name == "rmsprop":
+        opt = optax.rmsprop(lr)
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_name}")
+
+    optimizer = nnx.Optimizer(model, opt)
     metrics = nnx.MultiMetric(neg_logprob=nnx.metrics.Average("neg_logprob"))
 
     X = adata.X
