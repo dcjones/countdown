@@ -158,7 +158,7 @@ class SimpleEncoder(nnx.Module):
         self.bias = nnx.Param(jnp.zeros(k))
 
     def __call__(self, X: jax.Array | BCSR):
-        u = nnx.softplus(X @ self.weights.value + self.bias.value)
+        u = nnx.softplus(X @ self.weights[...] + self.bias[...])
         return u
 
 
@@ -184,7 +184,7 @@ class DeepSoftplusEncoder(nnx.Module):
         self.lyr2 = nnx.Linear(hidden_dim, k, rngs=rngs)
 
     def __call__(self, X: jax.Array | BCSR):
-        h = X @ self.weights1.value + self.bias1.value
+        h = X @ self.weights1[...] + self.bias1[...]
         h = nnx.softplus(h)
         h = self.lyr2(h)
         u = nnx.softplus(h)
@@ -214,7 +214,7 @@ class DeepCompactEncoder(nnx.Module):
         self.lyr2 = nnx.Linear(k, k, rngs=rngs)
 
     def __call__(self, X: jax.Array | BCSR):
-        h = X @ self.weights1.value + self.bias1.value
+        h = X @ self.weights1[...] + self.bias1[...]
         h = nnx.softplus(h)
         h = self.lyr2(h)
         u = nnx.softplus(h)
@@ -252,10 +252,10 @@ class BoundedAuxiliaryEncoder(nnx.Module):
 
     def __call__(self, X: jax.Array | BCSR):
         # Main direct path
-        u_direct = X @ self.weights_direct.value + self.bias_direct.value
+        u_direct = X @ self.weights_direct[...] + self.bias_direct[...]
 
         # Auxiliary refinement
-        u_aux = X @ self.weights_aux.value + self.bias_aux.value
+        u_aux = X @ self.weights_aux[...] + self.bias_aux[...]
         u_aux = jnp.tanh(u_aux)  # bounded correction
 
         # Combine and apply softplus
@@ -292,11 +292,11 @@ class ScaleEncoder(nnx.Module):
 
     def __call__(self, X: jax.Array | BCSR):
         # Hidden layer with softplus activation
-        h = X @ self.weights1.value + self.bias1.value
+        h = X @ self.weights1[...] + self.bias1[...]
         h = nnx.softplus(h)
 
         # Output layer (log_scale)
-        log_scale = h @ self.weights2.value + self.bias2.value
+        log_scale = h @ self.weights2[...] + self.bias2[...]
 
         return log_scale
 
@@ -397,13 +397,13 @@ class NMF(nnx.Module):
         return lambda_scaled, u, log_scale
 
     def v_norm(self) -> jax.Array:
-        return nnx.softmax(self.v.value, axis=1)
+        return nnx.softmax(self.v[...], axis=1)
 
     def v_scaled(self) -> jax.Array:
         return self.v_norm()
 
     def r(self) -> jax.Array:
-        return jnp.exp(self.log_r.value)
+        return jnp.exp(self.log_r[...])
 
     def metagene_regularization(self, u: jax.Array) -> jax.Array:
         """
@@ -655,7 +655,7 @@ def neg_poisson_logprob_sparse(model: NMF, X: BCSR, constant_terms: bool = False
 def neg_nb_logprob_dense(model: NMF, X: jax.Array, constant_terms: bool = False):
     λ, u, log_scale = model(X)  # [ncells, ngenes], [ncells]
     r = jnp.expand_dims(model.r(), 0)  # [1, ngenes]
-    log_r = jnp.expand_dims(model.log_r.value, 0)  # [1, ngenes]
+    log_r = jnp.expand_dims(model.log_r[...], 0)  # [1, ngenes]
     log_λr = jnp.log(λ + r)  # [ncells, ngenes]
     log_λ = jnp.log(λ)
     gammaln_r = jax.scipy.special.gammaln(r)  # [1, ngenes]
@@ -685,7 +685,7 @@ def neg_nb_logprob_dense(model: NMF, X: jax.Array, constant_terms: bool = False)
 def neg_nb_logprob_sparse(model: NMF, X: BCSR, constant_terms: bool = False):
     λ, u, log_scale = model(X)  # [ncells, ngenes], [ncells]
     r = jnp.expand_dims(model.r(), 0)  # [1, ngenes]
-    log_r = jnp.expand_dims(model.log_r.value, 0)  # [1, ngenes]
+    log_r = jnp.expand_dims(model.log_r[...], 0)  # [1, ngenes]
     log_λr = jnp.log(λ + r)  # [ncells, ngenes]
     log_λ = jnp.log(λ)
     gammaln_r = jax.scipy.special.gammaln(r)  # [1, ngenes]
@@ -740,7 +740,7 @@ def create_train_step_dense(likelihood: str):
     def train_step(model: NMF, optimizer: nnx.Optimizer, X: jax.Array):
         """Fused forward, backward, and optimizer update for dense input."""
         loss, grads = nnx.value_and_grad(loss_fn)(model, X)
-        optimizer.update(grads)
+        optimizer.update(model, grads)
         return loss
 
     return train_step
@@ -761,7 +761,7 @@ def create_train_step_sparse(likelihood: str):
     def train_step(model: NMF, optimizer: nnx.Optimizer, X: BCSR):
         """Fused forward, backward, and optimizer update for sparse BCSR input."""
         loss, grads = nnx.value_and_grad(loss_fn)(model, X)
-        optimizer.update(grads)
+        optimizer.update(model, grads)
         return loss
 
     return train_step
@@ -967,7 +967,7 @@ def nmf(
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
-    optimizer = nnx.Optimizer(model, opt)
+    optimizer = nnx.Optimizer(model, opt, wrt=nnx.Param)
     metrics = nnx.MultiMetric(neg_logprob=nnx.metrics.Average("neg_logprob"))
 
     X = adata.X
