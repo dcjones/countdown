@@ -1,145 +1,143 @@
-import sys
+import math
 
-import jax
-import jax.numpy as jnp
 import numpy as np
-import optax
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from anndata import AnnData
-from flax import nnx
-from jax._src.dtypes import JAXType
-from jax.experimental.sparse import BCSR, bcsr_extract
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import svds
 from tqdm import tqdm
 
 
+def _lgamma(x: torch.Tensor) -> torch.Tensor:
+    """
+    Log-gamma via Lanczos approximation (g=7, n=9).
+    Implemented with basic tensor ops to avoid NVRTC JIT compilation on CUDA.
+    Assumes x > 0 (which holds for all uses in this module).
+    """
+    _lanczos_p = torch.tensor(
+        [
+            0.99999999999980993,
+            676.5203681218851,
+            -1259.1392167224028,
+            771.32342877765313,
+            -176.61502916214059,
+            12.507343278686905,
+            -0.13857109526572012,
+            9.9843695780195716e-6,
+            1.5056327351493116e-7,
+        ],
+        dtype=x.dtype,
+        device=x.device,
+    )
+    g = 7.0
+    z = x - 1.0
+    t = z + g + 0.5
+    s = _lanczos_p[0]
+    for i in range(1, len(_lanczos_p)):
+        s = s + _lanczos_p[i] / (z + i)
+    return 0.5 * math.log(2.0 * math.pi) + (z + 0.5) * torch.log(t) - t + torch.log(s)
+
+
 def as_dense_f32(X: csr_matrix | np.ndarray) -> np.ndarray:
     if isinstance(X, csr_matrix):
-        return X.todense().astype(np.float32)
+        return np.asarray(X.todense()).astype(np.float32)
     else:
         return X.astype(np.float32)
 
 
-class CSRMatrixRowSampler:
-    """Samples random batches of rows from a CSR matrix, yielding dense JAX arrays."""
-
-    def __init__(self, X: csr_matrix, batch_size: int):
-        m, n = X.shape
-        self.X = X.astype(np.float32)
-        self.idx = np.arange(m)
-        self.chunk = np.zeros((batch_size, n), dtype=np.float32)
-        self.batch_size = batch_size
-        self.m = m
-        self.n = n
-
-    def __iter__(self):
-        np.random.shuffle(self.idx)
-        for fr in range(0, len(self.idx), self.batch_size):
-            to = min(fr + self.batch_size, self.m)
-            batch_size = to - fr
-            batch_indices = self.idx[fr:to]
-            batch_indices.sort()
-
-            if batch_size == self.batch_size:
-                self.X[batch_indices, :].todense(out=self.chunk)
-                yield jnp.array(self.chunk)
-            else:
-                # Final partial batch - create appropriately sized array
-                partial_chunk = np.zeros((batch_size, self.n), dtype=np.float32)
-                self.X[batch_indices, :].todense(out=partial_chunk)
-                yield jnp.array(partial_chunk)
-
-
-class PaddedBCSRSampler:
+class SparseBatchSampler:
     """
-    Samples batches of rows from a CSR matrix as padded BCSR arrays.
+    Samples batches of rows from a CSR matrix as torch sparse_csr_tensor objects.
 
-    Precomputes padded batch data once at initialization (stored in CPU memory),
-    then converts to BCSR on-demand during iteration. All batches are padded to
-    uniform nse (number of stored elements) to avoid JIT recompilation.
+    Precomputes all batches at initialization (stored as numpy arrays in CPU memory),
+    then converts to torch.sparse_csr_tensor on demand during iteration.
     """
 
-    def __init__(self, X: csr_matrix, batch_size: int):
+    def __init__(self, X: csr_matrix | np.ndarray, batch_size: int, device: torch.device):
+        if not isinstance(X, csr_matrix):
+            from scipy.sparse import csr_matrix as make_csr
+            X = make_csr(X)
         m, n = X.shape
         X = X.astype(np.float32)
         self.n = n
+        self.device = device
 
-        # Shuffle once at initialization
         idx = np.arange(m)
         np.random.shuffle(idx)
 
-        # First pass: determine max nse across all batches
-        max_nse = 0
-        batch_indices_list = []
+        self._batches: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]] = []
         for fr in range(0, m, batch_size):
             to = min(fr + batch_size, m)
             batch_idx = idx[fr:to].copy()
             batch_idx.sort()
-            batch_indices_list.append(batch_idx)
             sliced = X[batch_idx, :]
-            max_nse = max(max_nse, sliced.nnz)
-
-        # Second pass: precompute padded numpy arrays for each batch
-        self._batches: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]] = []
-        for batch_idx in batch_indices_list:
-            sliced = X[batch_idx, :]
-            batch_m = sliced.shape[0]
-            current_nse = sliced.nnz
-            pad_size = max_nse - current_nse
-
-            if pad_size > 0:
-                data = np.concatenate(
-                    [sliced.data, np.zeros(pad_size, dtype=np.float32)]
-                )
-                indices = np.concatenate(
-                    [sliced.indices, np.zeros(pad_size, dtype=np.int32)]
-                )
-                indptr = sliced.indptr.copy()
-                indptr[-1] = max_nse
-            else:
-                data = sliced.data.copy()
-                indices = sliced.indices.copy()
-                indptr = sliced.indptr.copy()
-
-            self._batches.append((data, indices, indptr, batch_m))
+            self._batches.append((
+                sliced.data.copy(),
+                sliced.indices.astype(np.int64),
+                sliced.indptr.astype(np.int64),
+                sliced.shape[0],
+            ))
 
     def __iter__(self):
-        for data, indices, indptr, batch_m in self._batches:
-            yield BCSR(
-                (
-                    jnp.array(data),
-                    jnp.array(indices, dtype=jnp.int32),
-                    jnp.array(indptr, dtype=jnp.int32),
-                ),
-                shape=(batch_m, self.n),
-            )
+        with torch.sparse.check_sparse_tensor_invariants(enable=False):
+            for data, indices, indptr, batch_m in self._batches:
+                crow = torch.from_numpy(indptr).to(self.device)
+                col  = torch.from_numpy(indices).to(self.device)
+                vals = torch.from_numpy(data).to(self.device)
+                yield torch.sparse_csr_tensor(
+                    crow, col, vals,
+                    size=(batch_m, self.n),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
 
 
-class DenseMatrixRowSampler:
-    def __init__(self, X: np.ndarray, batch_size: int):
-        m, n = X.shape
+class DenseRowSampler:
+    """Samples random batches of rows from a CSR or dense matrix, yielding dense tensors."""
+
+    def __init__(self, X: csr_matrix | np.ndarray, batch_size: int, device: torch.device):
+        if isinstance(X, csr_matrix):
+            X = np.asarray(X.todense()).astype(np.float32)
+        else:
+            X = X.astype(np.float32)
         self.X = X
+        m, _ = X.shape
         self.idx = np.arange(m)
-        self.chunk = np.zeros((batch_size, n), dtype=np.float32)
         self.batch_size = batch_size
         self.m = m
-        self.n = n
+        self.device = device
 
     def __iter__(self):
         np.random.shuffle(self.idx)
-        for fr in range(0, len(self.idx), self.batch_size):
+        for fr in range(0, self.m, self.batch_size):
             to = min(fr + self.batch_size, self.m)
-            batch_size = to - fr
-            if batch_size == self.batch_size:
-                self.chunk[:] = self.X[self.idx[fr:to], :]
-                yield jnp.array(self.chunk)
-            else:
-                # Final partial batch
-                partial_chunk = self.X[self.idx[fr:to], :].astype(np.float32)
-                yield jnp.array(partial_chunk)
+            batch = self.X[self.idx[fr:to], :]
+            yield torch.tensor(batch, dtype=torch.float32, device=self.device)
 
 
-class SimpleEncoder(nnx.Module):
+class SparseLinear(nn.Module):
+    """
+    Linear layer that handles both sparse CSR and dense input.
+    Weight is stored as [in_features, out_features] for torch.sparse.mm compatibility.
+    Initialized with LeCun normal (std = sqrt(1/fan_in)).
+    """
+
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(in_features, out_features))
+        self.bias = nn.Parameter(torch.zeros(out_features))
+        std = math.sqrt(1.0 / in_features)
+        nn.init.normal_(self.weight, 0.0, std)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.layout == torch.sparse_csr:
+            return torch.sparse.mm(x, self.weight) + self.bias
+        return x @ self.weight + self.bias
+
+
+class SimpleEncoder(nn.Module):
     """
     Simple single-layer encoder: X -> linear -> softplus -> U
 
@@ -151,18 +149,15 @@ class SimpleEncoder(nnx.Module):
     Best for: Quick results, interpretability, low metagene correlation
     """
 
-    def __init__(self, n: int, k: int, *, rngs: nnx.Rngs):
-        self.weights = nnx.Param(
-            nnx.initializers.lecun_normal()(rngs.params(), (n, k), jnp.float32)
-        )
-        self.bias = nnx.Param(jnp.zeros(k))
+    def __init__(self, n: int, k: int):
+        super().__init__()
+        self.layer = SparseLinear(n, k)
 
-    def __call__(self, X: jax.Array | BCSR):
-        u = nnx.softplus(X @ self.weights[...] + self.bias[...])
-        return u
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.softplus(self.layer(x))
 
 
-class DeepSoftplusEncoder(nnx.Module):
+class DeepSoftplusEncoder(nn.Module):
     """
     Two-layer encoder with softplus activations: X -> hidden -> output
 
@@ -175,24 +170,20 @@ class DeepSoftplusEncoder(nnx.Module):
     Recommended with: metagene_reg_type="correlation", metagene_reg_strength=0.01
     """
 
-    def __init__(self, n: int, k: int, hidden_dim: int, *, rngs: nnx.Rngs):
-        self.weights1 = nnx.Param(
-            nnx.initializers.lecun_normal()(rngs.params(), (n, hidden_dim), jnp.float32)
-        )
-        self.bias1 = nnx.Param(jnp.zeros(hidden_dim))
+    def __init__(self, n: int, k: int, hidden_dim: int):
+        super().__init__()
+        self.layer1 = SparseLinear(n, hidden_dim)
+        self.layer2 = nn.Linear(hidden_dim, k)
+        std = math.sqrt(1.0 / hidden_dim)
+        nn.init.normal_(self.layer2.weight, 0.0, std)
+        nn.init.zeros_(self.layer2.bias)
 
-        self.lyr2 = nnx.Linear(hidden_dim, k, rngs=rngs)
-
-    def __call__(self, X: jax.Array | BCSR):
-        h = X @ self.weights1[...] + self.bias1[...]
-        h = nnx.softplus(h)
-        h = self.lyr2(h)
-        u = nnx.softplus(h)
-
-        return u
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = F.softplus(self.layer1(x))
+        return F.softplus(self.layer2(h))
 
 
-class DeepCompactEncoder(nnx.Module):
+class DeepCompactEncoder(nn.Module):
     """
     Compact two-layer encoder: X -> k-dim hidden -> k output
 
@@ -204,25 +195,21 @@ class DeepCompactEncoder(nnx.Module):
     Best for: Good likelihood with lower capacity, works well with regularization
     """
 
-    def __init__(self, n: int, k: int, hidden_dim: int, *, rngs: nnx.Rngs):
-        # Use k as hidden dim instead of hidden_dim to match SimpleEncoder capacity
-        self.weights1 = nnx.Param(
-            nnx.initializers.lecun_normal()(rngs.params(), (n, k), jnp.float32)
-        )
-        self.bias1 = nnx.Param(jnp.zeros(k))
+    def __init__(self, n: int, k: int, hidden_dim: int):  # noqa: ARG002
+        super().__init__()
+        # Uses k as hidden dim, ignoring hidden_dim, to match SimpleEncoder capacity
+        self.layer1 = SparseLinear(n, k)
+        self.layer2 = nn.Linear(k, k)
+        std = math.sqrt(1.0 / k)
+        nn.init.normal_(self.layer2.weight, 0.0, std)
+        nn.init.zeros_(self.layer2.bias)
 
-        self.lyr2 = nnx.Linear(k, k, rngs=rngs)
-
-    def __call__(self, X: jax.Array | BCSR):
-        h = X @ self.weights1[...] + self.bias1[...]
-        h = nnx.softplus(h)
-        h = self.lyr2(h)
-        u = nnx.softplus(h)
-
-        return u
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = F.softplus(self.layer1(x))
+        return F.softplus(self.layer2(h))
 
 
-class BoundedAuxiliaryEncoder(nnx.Module):
+class BoundedAuxiliaryEncoder(nn.Module):
     """
     Direct + bounded auxiliary path encoder
 
@@ -237,78 +224,53 @@ class BoundedAuxiliaryEncoder(nnx.Module):
     Best for: Good likelihood + low correlation without needing regularization
     """
 
-    def __init__(self, n: int, k: int, hidden_dim: int, *, rngs: nnx.Rngs):
-        # Primary path: direct like SimpleEncoder
-        self.weights_direct = nnx.Param(
-            nnx.initializers.lecun_normal()(rngs.params(), (n, k), jnp.float32)
-        )
-        self.bias_direct = nnx.Param(jnp.zeros(k))
+    def __init__(self, n: int, k: int, hidden_dim: int):
+        super().__init__()
+        self.direct = SparseLinear(n, k)
+        self.aux = SparseLinear(n, k)
+        # Scale aux weights down by 0.1 to match JAX initialization
+        with torch.no_grad():
+            self.aux.weight.mul_(0.1)
 
-        # Auxiliary path for refinement (small weight 0.1)
-        self.weights_aux = nnx.Param(
-            nnx.initializers.lecun_normal()(rngs.params(), (n, k), jnp.float32) * 0.1
-        )
-        self.bias_aux = nnx.Param(jnp.zeros(k))
-
-    def __call__(self, X: jax.Array | BCSR):
-        # Main direct path
-        u_direct = X @ self.weights_direct[...] + self.bias_direct[...]
-
-        # Auxiliary refinement
-        u_aux = X @ self.weights_aux[...] + self.bias_aux[...]
-        u_aux = jnp.tanh(u_aux)  # bounded correction
-
-        # Combine and apply softplus
-        u = nnx.softplus(u_direct + u_aux)
-
-        return u
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        u_direct = self.direct(x)
+        u_aux = torch.tanh(self.aux(x))
+        return F.softplus(u_direct + u_aux)
 
 
-class ScaleEncoder(nnx.Module):
+class ScaleEncoder(nn.Module):
     """
     Simple MLP encoder for predicting cell-specific scale factors.
 
     Architecture:
-    - Input (n genes) -> hidden layer (16 units) -> softplus -> output (1 scale)
-    - Small hidden layer (16) for stability with high-dimensional sparse input
+    - Input (n genes) -> hidden layer (32 units) -> softplus -> output (1 scale)
+    - Small hidden layer for stability with high-dimensional sparse input
     - Predicts log_scale which is clipped and exponentiated
 
-    Trained separately from main encoder to provide stable scale predictions.
+    Trained jointly with main encoder to provide stable scale predictions.
     """
 
-    def __init__(self, n: int, *, rngs: nnx.Rngs):
-        # Small hidden layer for stability
+    def __init__(self, n: int):
+        super().__init__()
         hidden_dim = 32
+        self.layer1 = SparseLinear(n, hidden_dim)
+        self.layer2 = nn.Linear(hidden_dim, 1)
+        # Small initialization for stability (matches JAX: 1e-3 * normal)
+        nn.init.normal_(self.layer1.weight, 0.0, 1e-3)
+        nn.init.normal_(self.layer2.weight, 0.0, 1e-3)
+        nn.init.zeros_(self.layer2.bias)
 
-        self.weights1 = nnx.Param(
-            1e-3 * jax.random.normal(rngs.params(), (n, hidden_dim), dtype=jnp.float32)
-        )
-        self.bias1 = nnx.Param(jnp.zeros(hidden_dim))
-
-        self.weights2 = nnx.Param(
-            1e-3 * jax.random.normal(rngs.params(), (hidden_dim, 1), dtype=jnp.float32)
-        )
-        self.bias2 = nnx.Param(jnp.zeros(1))
-
-    def __call__(self, X: jax.Array | BCSR):
-        # Hidden layer with softplus activation
-        h = X @ self.weights1[...] + self.bias1[...]
-        h = nnx.softplus(h)
-
-        # Output layer (log_scale)
-        log_scale = h @ self.weights2[...] + self.bias2[...]
-
-        return log_scale
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = F.softplus(self.layer1(x))
+        return self.layer2(h)
 
 
-class NMF(nnx.Module):
+class NMF(nn.Module):
     def __init__(
         self,
         n: int,
         k: int,
         hidden_dim: int,
-        *,
-        rngs: nnx.Rngs,
         r_prior_alpha: float = 2.0,
         r_prior_beta: float = 2.0,
         scale_prior_sigma: float = 0.5,
@@ -317,21 +279,18 @@ class NMF(nnx.Module):
         metagene_reg_strength: float = 0.01,
         gene_scale_factors: bool = False,
         init_method: str = "normal",
-        v_init: jax.Array | None = None,
+        v_init: np.ndarray | None = None,
     ):
-        key = rngs.params()
+        super().__init__()
 
-        # Select encoder based on version
         if encoder_version == "simple":
-            self.encoder = SimpleEncoder(n, k, rngs=rngs)
+            self.encoder = SimpleEncoder(n, k)
         elif encoder_version == "deep_softplus":
-            self.encoder = DeepSoftplusEncoder(n, k, hidden_dim=hidden_dim, rngs=rngs)
+            self.encoder = DeepSoftplusEncoder(n, k, hidden_dim)
         elif encoder_version == "deep_compact":
-            self.encoder = DeepCompactEncoder(n, k, hidden_dim=hidden_dim, rngs=rngs)
+            self.encoder = DeepCompactEncoder(n, k, hidden_dim)
         elif encoder_version == "bounded_auxiliary":
-            self.encoder = BoundedAuxiliaryEncoder(
-                n, k, hidden_dim=hidden_dim, rngs=rngs
-            )
+            self.encoder = BoundedAuxiliaryEncoder(n, k, hidden_dim)
         else:
             raise ValueError(
                 f"Unknown encoder_version: {encoder_version}. "
@@ -339,28 +298,32 @@ class NMF(nnx.Module):
             )
 
         if v_init is not None:
-            self.v = nnx.Param(v_init)
+            self.v = nn.Parameter(torch.tensor(v_init, dtype=torch.float32))
         elif init_method == "normal":
-            self.v = nnx.Param(jax.random.normal(key, (k, n)) / jnp.sqrt(n))
+            v = torch.empty(k, n)
+            nn.init.normal_(v, std=1.0 / math.sqrt(n))
+            self.v = nn.Parameter(v)
         elif init_method == "uniform":
-            self.v = nnx.Param(
-                jax.random.uniform(key, (k, n), minval=-1.0, maxval=1.0) / jnp.sqrt(n)
-            )
+            v = torch.empty(k, n)
+            nn.init.uniform_(v, -1.0 / math.sqrt(n), 1.0 / math.sqrt(n))
+            self.v = nn.Parameter(v)
         elif init_method == "kaiming":
-            self.v = nnx.Param(nnx.initializers.he_normal()(key, (k, n), jnp.float32))
+            v = torch.empty(k, n)
+            nn.init.kaiming_normal_(v)
+            self.v = nn.Parameter(v)
         elif init_method == "xavier":
-            self.v = nnx.Param(
-                nnx.initializers.xavier_normal()(key, (k, n), jnp.float32)
-            )
+            v = torch.empty(k, n)
+            nn.init.xavier_normal_(v)
+            self.v = nn.Parameter(v)
         elif init_method == "orthogonal":
-            self.v = nnx.Param(nnx.initializers.orthogonal()(key, (k, n), jnp.float32))
+            v = torch.empty(k, n)
+            nn.init.orthogonal_(v)
+            self.v = nn.Parameter(v)
         else:
             raise ValueError(f"Unknown init_method: {init_method}")
 
-        self.log_r = nnx.Param(jnp.full(n, 1e-1))
-
-        # Separate scale encoder - simple MLP for predicting cell-specific scales
-        self.scale_encoder = ScaleEncoder(n, rngs=rngs)
+        self.log_r = nn.Parameter(torch.full((n,), 1e-1))
+        self.scale_encoder = ScaleEncoder(n)
 
         # Store prior hyperparameters (not trainable)
         self.r_prior_alpha = r_prior_alpha
@@ -371,41 +334,28 @@ class NMF(nnx.Module):
         self.gene_scale_factors = gene_scale_factors
 
     # X: [batch_size, n]
-    def __call__(self, X: jax.Array | BCSR) -> jax.Array:
-        u = self.encoder(X)  # [batch_size, k]
-
-        # Predict log_scale using separate scale encoder
-        log_scale = self.scale_encoder(X)  # [batch_size, 1]
-
-        # Clip log_scale to prevent overflow in exp()
-        # Allows scales from exp(-10) ≈ 0.000045 to exp(10) ≈ 22026
-        log_scale = jnp.clip(log_scale, -10.0, 10.0)
-
-        scale = jnp.exp(log_scale)  # [batch_size, 1]
-
-        # jax.debug.print("mean scale: {}", jnp.mean(scale))
-        # jax.debug.print("scale: [{}, {}]", jnp.min(scale), jnp.max(scale))
-
-        lambda_base = u @ self.v_scaled()  # [batch_size, n]
-        # Scale each cell's predictions by its scale factor
-
+    def forward(self, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        u = self.encoder(X)                          # [batch_size, k]
+        log_scale = self.scale_encoder(X)            # [batch_size, 1]
+        log_scale = log_scale.clamp(-10.0, 10.0)
+        scale = torch.exp(log_scale)                 # [batch_size, 1]
+        lambda_base = u @ self.v_scaled()            # [batch_size, n]
         if self.gene_scale_factors:
-            lambda_scaled = lambda_base * scale  # [batch_size, n]
+            lambda_scaled = lambda_base * scale
         else:
             lambda_scaled = lambda_base
-
         return lambda_scaled, u, log_scale
 
-    def v_norm(self) -> jax.Array:
-        return nnx.softmax(self.v[...], axis=1)
+    def v_norm(self) -> torch.Tensor:
+        return F.softmax(self.v, dim=1)
 
-    def v_scaled(self) -> jax.Array:
+    def v_scaled(self) -> torch.Tensor:
         return self.v_norm()
 
-    def r(self) -> jax.Array:
-        return jnp.exp(self.log_r[...])
+    def r(self) -> torch.Tensor:
+        return torch.exp(self.log_r)
 
-    def metagene_regularization(self, u: jax.Array) -> jax.Array:
+    def metagene_regularization(self, u: torch.Tensor) -> torch.Tensor:
         """
         Compute regularization term to encourage diverse/orthogonal metagenes.
 
@@ -415,159 +365,107 @@ class NMF(nnx.Module):
         Returns penalty term (to be minimized).
         """
         if self.metagene_reg_type == "none":
-            return 0.0
+            return torch.zeros(1, device=self.v.device).squeeze()
 
-        # Get normalized V matrix (k x n), each row is a metagene
         v_norm = self.v_norm()  # [k, n]
 
         if self.metagene_reg_type == "correlation":
-            # Penalize correlation between metagene rows
-            # Compute correlation matrix: corr[i,j] = correlation between metagene i and j
-            # First center each row
-            v_centered = v_norm - jnp.mean(v_norm, axis=1, keepdims=True)
-            # Compute row norms
-            row_norms = jnp.sqrt(jnp.sum(v_centered**2, axis=1, keepdims=True))
-            # Normalize
+            v_centered = v_norm - v_norm.mean(dim=1, keepdim=True)
+            row_norms = torch.sqrt((v_centered ** 2).sum(dim=1, keepdim=True))
             v_normalized = v_centered / (row_norms + 1e-8)
-            # Compute correlation matrix
             corr_matrix = v_normalized @ v_normalized.T  # [k, k]
-            # Penalize off-diagonal elements (we want them near 0)
-            # Extract off-diagonal using mask
             k = corr_matrix.shape[0]
-            mask = 1.0 - jnp.eye(k)
-            off_diag_corr = corr_matrix * mask
-            penalty = jnp.sum(off_diag_corr**2)
+            mask = 1.0 - torch.eye(k, device=v_norm.device)
+            penalty = ((corr_matrix * mask) ** 2).sum()
             return self.metagene_reg_strength * penalty
 
         elif self.metagene_reg_type == "orthogonal":
-            # Penalize V @ V^T being far from identity
-            # V is [k, n], so V @ V^T is [k, k]
             gram = v_norm @ v_norm.T  # [k, k]
             k = gram.shape[0]
-            identity = jnp.eye(k)
-            penalty = jnp.sum((gram - identity) ** 2)
+            identity = torch.eye(k, device=v_norm.device)
+            penalty = ((gram - identity) ** 2).sum()
             return self.metagene_reg_strength * penalty
 
         elif self.metagene_reg_type == "cosine":
-            # Penalize cosine similarity between metagene pairs
-            # Normalize rows to unit length
-            row_norms = jnp.sqrt(jnp.sum(v_norm**2, axis=1, keepdims=True))
+            row_norms = torch.sqrt((v_norm ** 2).sum(dim=1, keepdim=True))
             v_unit = v_norm / (row_norms + 1e-8)
-            # Compute cosine similarity matrix
             cosine_sim = v_unit @ v_unit.T  # [k, k]
-            # Penalize off-diagonal (want low similarity)
             k = cosine_sim.shape[0]
-            mask = 1.0 - jnp.eye(k)
-            off_diag_sim = cosine_sim * mask
-            penalty = jnp.sum(off_diag_sim**2)
+            mask = 1.0 - torch.eye(k, device=v_norm.device)
+            penalty = ((cosine_sim * mask) ** 2).sum()
             return self.metagene_reg_strength * penalty
 
         elif self.metagene_reg_type == "entropy":
-            # Encourage even usage of metagenes across cells
-            # Compute mean usage per metagene across this batch
-            u_mean = jnp.mean(u, axis=0)  # [k]
-            # Normalize to sum to 1
-            u_prob = u_mean / (jnp.sum(u_mean) + 1e-8)
-            # Compute entropy (higher = more even usage)
-            entropy = -jnp.sum(u_prob * jnp.log(u_prob + 1e-8))
-            # Penalize low entropy (we want to maximize entropy, so minimize negative)
-            max_entropy = jnp.log(float(u.shape[1]))  # log(k)
+            u_mean = u.mean(dim=0)  # [k]
+            u_prob = u_mean / (u_mean.sum() + 1e-8)
+            entropy = -(u_prob * torch.log(u_prob + 1e-8)).sum()
+            max_entropy = math.log(float(u.shape[1]))
             penalty = max_entropy - entropy
             return self.metagene_reg_strength * penalty
 
         elif self.metagene_reg_type == "usage":
-            # Penalize unused metagenes
-            # Count which metagenes are active (>threshold) in this batch
             threshold = 0.1
-            # Use sigmoid for differentiable approximation of indicator function (u > threshold)
-            # steepness=100 makes transition sharp enough to avoid false positives for zero inputs
-            active = jnp.mean(
-                jax.nn.sigmoid(100.0 * (u - threshold)), axis=0
-            )  # [k] - fraction of cells using each metagene
-            # Penalize metagenes with low usage
-            penalty = jnp.sum(jnp.maximum(0.01 - active, 0.0))  # Penalize if <1% usage
+            active = torch.sigmoid(100.0 * (u - threshold)).mean(dim=0)  # [k]
+            penalty = torch.clamp(0.01 - active, min=0.0).sum()
             return self.metagene_reg_strength * penalty
 
         elif self.metagene_reg_type == "weighted_correlation":
-            # Weight correlation by gene variance to focus on expressed genes
-            # This addresses the "useless orthogonal metagenes" problem
-
-            # Compute gene weights from V (high variance in V = important gene)
-            gene_variance = jnp.var(v_norm, axis=0)  # [n]
-            gene_weights = gene_variance / (jnp.sum(gene_variance) + 1e-8)
-
-            # Weight each gene's contribution to correlation
-            v_weighted = v_norm * jnp.sqrt(gene_weights)  # Weight before correlation
-
-            # Compute correlation on weighted V
-            v_centered = v_weighted - jnp.mean(v_weighted, axis=1, keepdims=True)
-            row_norms = jnp.sqrt(jnp.sum(v_centered**2, axis=1, keepdims=True))
+            gene_variance = v_norm.var(dim=0)  # [n]
+            gene_weights = gene_variance / (gene_variance.sum() + 1e-8)
+            v_weighted = v_norm * torch.sqrt(gene_weights)
+            v_centered = v_weighted - v_weighted.mean(dim=1, keepdim=True)
+            row_norms = torch.sqrt((v_centered ** 2).sum(dim=1, keepdim=True))
             v_normalized = v_centered / (row_norms + 1e-8)
             corr_matrix = v_normalized @ v_normalized.T
-
-            # Penalize off-diagonal
             k = corr_matrix.shape[0]
-            mask = 1.0 - jnp.eye(k)
-            penalty = jnp.sum((corr_matrix * mask) ** 2)
+            mask = 1.0 - torch.eye(k, device=v_norm.device)
+            penalty = ((corr_matrix * mask) ** 2).sum()
             return self.metagene_reg_strength * penalty
 
         elif self.metagene_reg_type == "combined":
-            # Combine weighted correlation + entropy regularization
-            # This should give decorrelated metagenes that are actually used
-
-            # 1. Weighted correlation (focus on expressed genes)
-            gene_variance = jnp.var(v_norm, axis=0)
-            gene_weights = gene_variance / (jnp.sum(gene_variance) + 1e-8)
-            v_weighted = v_norm * jnp.sqrt(gene_weights)
-            v_centered = v_weighted - jnp.mean(v_weighted, axis=1, keepdims=True)
-            row_norms = jnp.sqrt(jnp.sum(v_centered**2, axis=1, keepdims=True))
+            # Weighted correlation
+            gene_variance = v_norm.var(dim=0)
+            gene_weights = gene_variance / (gene_variance.sum() + 1e-8)
+            v_weighted = v_norm * torch.sqrt(gene_weights)
+            v_centered = v_weighted - v_weighted.mean(dim=1, keepdim=True)
+            row_norms = torch.sqrt((v_centered ** 2).sum(dim=1, keepdim=True))
             v_normalized = v_centered / (row_norms + 1e-8)
             corr_matrix = v_normalized @ v_normalized.T
             k = corr_matrix.shape[0]
-            mask = 1.0 - jnp.eye(k)
-            corr_penalty = jnp.sum((corr_matrix * mask) ** 2)
-
-            # 2. Entropy (encourage even usage)
-            u_mean = jnp.mean(u, axis=0)
-            u_prob = u_mean / (jnp.sum(u_mean) + 1e-8)
-            entropy = -jnp.sum(u_prob * jnp.log(u_prob + 1e-8))
-            max_entropy = jnp.log(float(u.shape[1]))
+            mask = 1.0 - torch.eye(k, device=v_norm.device)
+            corr_penalty = ((corr_matrix * mask) ** 2).sum()
+            # Entropy
+            u_mean = u.mean(dim=0)
+            u_prob = u_mean / (u_mean.sum() + 1e-8)
+            entropy = -(u_prob * torch.log(u_prob + 1e-8)).sum()
+            max_entropy = math.log(float(u.shape[1]))
             entropy_penalty = max_entropy - entropy
-
-            # Combine with equal weight
             return self.metagene_reg_strength * (corr_penalty + entropy_penalty)
 
         elif self.metagene_reg_type == "balanced":
-            # Like combined, but weighs entropy significantly higher to force usage
-
-            # 1. Weighted correlation
-            gene_variance = jnp.var(v_norm, axis=0)
-            gene_weights = gene_variance / (jnp.sum(gene_variance) + 1e-8)
-            v_weighted = v_norm * jnp.sqrt(gene_weights)
-            v_centered = v_weighted - jnp.mean(v_weighted, axis=1, keepdims=True)
-            row_norms = jnp.sqrt(jnp.sum(v_centered**2, axis=1, keepdims=True))
+            # Weighted correlation
+            gene_variance = v_norm.var(dim=0)
+            gene_weights = gene_variance / (gene_variance.sum() + 1e-8)
+            v_weighted = v_norm * torch.sqrt(gene_weights)
+            v_centered = v_weighted - v_weighted.mean(dim=1, keepdim=True)
+            row_norms = torch.sqrt((v_centered ** 2).sum(dim=1, keepdim=True))
             v_normalized = v_centered / (row_norms + 1e-8)
             corr_matrix = v_normalized @ v_normalized.T
             k = corr_matrix.shape[0]
-            mask = 1.0 - jnp.eye(k)
-            corr_penalty = jnp.sum((corr_matrix * mask) ** 2)
-
-            # 2. Entropy
-            u_mean = jnp.mean(u, axis=0)
-            u_prob = u_mean / (jnp.sum(u_mean) + 1e-8)
-            entropy = -jnp.sum(u_prob * jnp.log(u_prob + 1e-8))
-            max_entropy = jnp.log(float(u.shape[1]))
+            mask = 1.0 - torch.eye(k, device=v_norm.device)
+            corr_penalty = ((corr_matrix * mask) ** 2).sum()
+            # Entropy with higher weight to force usage
+            u_mean = u.mean(dim=0)
+            u_prob = u_mean / (u_mean.sum() + 1e-8)
+            entropy = -(u_prob * torch.log(u_prob + 1e-8)).sum()
+            max_entropy = math.log(float(u.shape[1]))
             entropy_penalty = max_entropy - entropy
-
-            # Higher weight on entropy (1,000,000x)
-            return self.metagene_reg_strength * (
-                corr_penalty + 1000000.0 * entropy_penalty
-            )
+            return self.metagene_reg_strength * (corr_penalty + 1_000_000.0 * entropy_penalty)
 
         else:
-            return 0.0
+            return torch.zeros(1, device=self.v.device).squeeze()
 
-    def log_prior(self, u: jax.Array, log_scale: jax.Array) -> jax.Array:
+    def log_prior(self, u: torch.Tensor, log_scale: torch.Tensor) -> torch.Tensor:
         """
         Compute log prior for all parameters.
 
@@ -577,194 +475,124 @@ class NMF(nnx.Module):
         - Optional metagene regularization (correlation, orthogonal, or cosine)
 
         Args:
-            scale_logit: [batch_size] array of scale logit values for current batch
+            u: [batch_size, k] metagene usage for current batch
+            log_scale: [batch_size, 1] log scale values for current batch
 
         Returns negative log prior (to be minimized).
         """
-        # Gamma prior on r
         r = self.r()
         alpha = self.r_prior_alpha
         beta = self.r_prior_beta
 
         log_prior_r = (
-            alpha * jnp.log(beta)
-            - jax.scipy.special.gammaln(alpha)
-            + (alpha - 1) * jnp.log(r)
+            alpha * math.log(beta)
+            - math.lgamma(alpha)
+            + (alpha - 1) * torch.log(r)
             - beta * r
         )
+        neg_log_prior = -log_prior_r.sum()
 
-        neg_log_prior = -jnp.sum(log_prior_r)
-
-        # Normal(0, sigma) prior on scale_logit
-        # p(scale_logit) = (1 / sqrt(2*pi*sigma^2)) * exp(-scale_logit^2 / (2*sigma^2))
-        # log p(scale_logit) = -0.5*log(2*pi) - log(sigma) - scale_logit^2 / (2*sigma^2)
         sigma = self.scale_prior_sigma
         log_prior_scale = (
-            -0.5 * jnp.log(2 * jnp.pi) - jnp.log(sigma) - log_scale**2 / (2 * sigma**2)
+            -0.5 * math.log(2 * math.pi)
+            - math.log(sigma)
+            - log_scale ** 2 / (2 * sigma ** 2)
         )
+        neg_log_prior = neg_log_prior - log_prior_scale.sum()
 
-        neg_log_prior += -jnp.sum(log_prior_scale)
-
-        # Add metagene regularization (pass u for usage-based penalties)
-        # Now supports entropy, usage, weighted_correlation, and combined modes
-        neg_log_prior += self.metagene_regularization(u)
-
-        # c = 100.0
-        # neg_log_prior += -c * jnp.sum(jax.scipy.special.entr(usage))
+        neg_log_prior = neg_log_prior + self.metagene_regularization(u)
 
         return neg_log_prior
 
 
-def neg_poisson_logprob_dense(model: NMF, X: jax.Array, constant_terms: bool = False):
-    """Negative log probability for dense input."""
+def _sparse_row_col_indices(
+    X: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns (row_idx, col_idx) arrays indexing every non-zero element in a sparse_csr_tensor."""
+    crow = X.crow_indices()
+    col_idx = X.col_indices()
+    batch_size = X.shape[0]
+    row_idx = torch.repeat_interleave(
+        torch.arange(batch_size, device=X.device),
+        crow[1:] - crow[:-1],
+    )
+    return row_idx, col_idx
+
+
+def neg_poisson_logprob_dense(model: NMF, X: torch.Tensor, constant_terms: bool = False):
+    """Negative log posterior for dense input under Poisson likelihood."""
     λ, u, log_scale = model(X)
-    lp = (X * jnp.log(jnp.clip(λ, 1e-8))).sum() - jnp.sum(λ)
-
-    # constant wrt to parameters
+    lp = (X * torch.log(λ.clamp(1e-8))).sum() - λ.sum()
     if constant_terms:
-        lp -= jnp.sum(jax.scipy.special.gammaln(X + 1))
-
-    neg_log_likelihood = -lp
-
-    # Add negative log prior (for MAP estimation)
-    neg_log_posterior = neg_log_likelihood + model.log_prior(u, log_scale)
-
-    return neg_log_posterior
+        lp -= _lgamma(X + 1).sum()
+    return -lp + model.log_prior(u, log_scale)
 
 
-def neg_poisson_logprob_sparse(model: NMF, X: BCSR, constant_terms: bool = False):
-    """Negative log probability for sparse BCSR input."""
+def neg_poisson_logprob_sparse(model: NMF, X: torch.Tensor, constant_terms: bool = False):
+    """Negative log posterior for sparse CSR input under Poisson likelihood."""
     λ, u, log_scale = model(X)
-    # Extract λ values only at non-zero positions of X
-    lp = (
-        X.data * jnp.log(jnp.clip(bcsr_extract(X.indices, X.indptr, λ), 1e-8))
-    ).sum() - jnp.sum(λ)
-
-    # constant wrt to parameters
+    row_idx, col_idx = _sparse_row_col_indices(X)
+    x_data = X.values()
+    lp = (x_data * torch.log(λ[row_idx, col_idx].clamp(1e-8))).sum() - λ.sum()
     if constant_terms:
-        lp -= jnp.sum(jax.scipy.special.gammaln(X.data + 1))
-
-    neg_log_likelihood = -lp
-
-    # Add negative log prior (for MAP estimation)
-    neg_log_posterior = neg_log_likelihood + model.log_prior(u, log_scale)
-
-    return neg_log_posterior
+        lp -= _lgamma(x_data + 1).sum()
+    return -lp + model.log_prior(u, log_scale)
 
 
-def neg_nb_logprob_dense(model: NMF, X: jax.Array, constant_terms: bool = False):
-    λ, u, log_scale = model(X)  # [ncells, ngenes], [ncells]
-    r = jnp.expand_dims(model.r(), 0)  # [1, ngenes]
-    log_r = jnp.expand_dims(model.log_r[...], 0)  # [1, ngenes]
-    log_λr = jnp.log(λ + r)  # [ncells, ngenes]
-    log_λ = jnp.log(λ)
-    gammaln_r = jax.scipy.special.gammaln(r)  # [1, ngenes]
+def neg_nb_logprob_dense(model: NMF, X: torch.Tensor, constant_terms: bool = False):
+    """Negative log posterior for dense input under Negative Binomial likelihood."""
+    λ, u, log_scale = model(X)
+    r = model.r().unsqueeze(0)        # [1, n]
+    log_r = model.log_r.unsqueeze(0)  # [1, n]
+    log_λr = torch.log(λ + r)
+    log_λ = torch.log(λ)
+    gammaln_r = _lgamma(r)  # [1, n]
 
     ncells = X.shape[0]
 
-    lp = 0.0
-    lp += -jnp.sum(ncells * gammaln_r)
+    lp = -(ncells * gammaln_r).sum()
+    lp += (ncells * r * log_r).sum()
+    lp -= (r * log_λr.sum(dim=0, keepdim=True)).sum()
+    lp += (X * (log_λ - log_λr)).sum()
+    lp += _lgamma(X + r).sum()
 
-    lp += jnp.sum(ncells * r * log_r)
-    lp -= jnp.sum(r * jnp.sum(log_λr, axis=0, keepdims=True))
-    lp += jnp.sum(X * (log_λ - log_λr))
-    lp += jnp.sum(jax.scipy.special.gammaln(X + r))
-
-    # constant wrt to parameters
     if constant_terms:
-        lp -= jnp.sum(jax.scipy.special.gammaln(X + 1))
+        lp -= _lgamma(X + 1).sum()
 
-    neg_log_likelihood = -lp
-
-    # Add negative log prior (for MAP estimation)
-    neg_log_posterior = neg_log_likelihood + model.log_prior(u, log_scale)
-
-    return neg_log_posterior
+    return -lp + model.log_prior(u, log_scale)
 
 
-def neg_nb_logprob_sparse(model: NMF, X: BCSR, constant_terms: bool = False):
-    λ, u, log_scale = model(X)  # [ncells, ngenes], [ncells]
-    r = jnp.expand_dims(model.r(), 0)  # [1, ngenes]
-    log_r = jnp.expand_dims(model.log_r[...], 0)  # [1, ngenes]
-    log_λr = jnp.log(λ + r)  # [ncells, ngenes]
-    log_λ = jnp.log(λ)
-    gammaln_r = jax.scipy.special.gammaln(r)  # [1, ngenes]
+def neg_nb_logprob_sparse(model: NMF, X: torch.Tensor, constant_terms: bool = False):
+    """Negative log posterior for sparse CSR input under Negative Binomial likelihood."""
+    λ, u, log_scale = model(X)
+    r = model.r().unsqueeze(0)        # [1, n]
+    log_r = model.log_r.unsqueeze(0)  # [1, n]
+    log_λr = torch.log(λ + r)
+    log_λ = torch.log(λ)
+    gammaln_r = _lgamma(r)  # [1, n]
 
     ncells = X.shape[0]
+    row_idx, col_idx = _sparse_row_col_indices(X)
+    x_data = X.values()
 
-    lp = 0.0
-    lp += -jnp.sum(ncells * gammaln_r)
+    lp = -(ncells * gammaln_r).sum()
+    lp += (ncells * r * log_r).sum()
+    lp -= (r * log_λr.sum(dim=0, keepdim=True)).sum()
 
-    lp += jnp.sum(ncells * r * log_r)
-    lp -= jnp.sum(r * jnp.sum(log_λr, axis=0, keepdims=True))
+    # X * (log_λ - log_λr) at non-zero positions only
+    log_diff = log_λ - log_λr
+    lp += (x_data * log_diff[row_idx, col_idx]).sum()
 
-    lp += jnp.sum(X.data * bcsr_extract(X.indices, X.indptr, log_λ - log_λr))
+    # gammaln(X + r) trick: avoids densifying X
+    # full sum over gammaln(r) per cell, then correct at non-zero positions
+    lp += (ncells * gammaln_r).sum()
+    lp -= gammaln_r[0, col_idx].sum()
+    lp += _lgamma(r[0, col_idx] + x_data).sum()
 
-    # This is the naive implementation of this term, which requires
-    # densifying X and redundantly computing gammaln across many identical values.
-    # lp += jnp.sum(jax.scipy.special.gammaln(X.todense() + r))
-
-    # Alternative, we can just do this, then subtract out the terms we want, etc.
-    lp += jnp.sum(ncells * gammaln_r)
-
-    # subtract out the log(gamma(r)) values where X is nonzero.
-    lp -= jnp.sum(gammaln_r[0, X.indices])
-
-    # compute just the log(gamma(r + x)) values where X is nonzero
-    lp += jnp.sum(jax.scipy.special.gammaln(r[0, X.indices] + X.data))
-
-    # constant wrt to parameters
     if constant_terms:
-        lp -= jnp.sum(jax.scipy.special.gammaln(X.data + 1))
+        lp -= _lgamma(x_data + 1).sum()
 
-    neg_log_likelihood = -lp
-
-    # Add negative log prior (for MAP estimation)
-    neg_log_posterior = neg_log_likelihood + model.log_prior(u, log_scale)
-
-    return neg_log_posterior
-
-
-def create_train_step_dense(likelihood: str):
-    """Create a JIT-compiled training step for dense input with specified likelihood."""
-    if likelihood == "nb":
-        loss_fn = neg_nb_logprob_dense
-    elif likelihood == "poisson":
-        loss_fn = neg_poisson_logprob_dense
-    else:
-        raise ValueError(
-            f"Unknown likelihood: {likelihood}. Must be 'nb' or 'poisson'."
-        )
-
-    @nnx.jit
-    def train_step(model: NMF, optimizer: nnx.Optimizer, X: jax.Array):
-        """Fused forward, backward, and optimizer update for dense input."""
-        loss, grads = nnx.value_and_grad(loss_fn)(model, X)
-        optimizer.update(model, grads)
-        return loss
-
-    return train_step
-
-
-def create_train_step_sparse(likelihood: str):
-    """Create a JIT-compiled training step for sparse BCSR input with specified likelihood."""
-    if likelihood == "nb":
-        loss_fn = neg_nb_logprob_sparse
-    elif likelihood == "poisson":
-        loss_fn = neg_poisson_logprob_sparse
-    else:
-        raise ValueError(
-            f"Unknown likelihood: {likelihood}. Must be 'nb' or 'poisson'."
-        )
-
-    @nnx.jit
-    def train_step(model: NMF, optimizer: nnx.Optimizer, X: BCSR):
-        """Fused forward, backward, and optimizer update for sparse BCSR input."""
-        loss, grads = nnx.value_and_grad(loss_fn)(model, X)
-        optimizer.update(model, grads)
-        return loss
-
-    return train_step
+    return -lp + model.log_prior(u, log_scale)
 
 
 def nmf(
@@ -822,7 +650,7 @@ def nmf(
         Minimum change in log-probability to be considered an improvement
         for early stopping.
     sparse : bool, default=True
-        If True, use sparse BCSR batches (memory efficient, allows larger batches).
+        If True, use sparse CSR batches (memory efficient, allows larger batches).
         If False, use dense batches (may be faster for smaller matrices).
     likelihood : str, default="nb"
         Likelihood function to use for the NMF model. Either "nb" or "poisson".
@@ -838,7 +666,7 @@ def nmf(
         Standard deviation for the Normal(0, sigma) prior on log scale values.
         Cell-specific scale factors are learned by the encoder using exp transformation.
         Smaller sigma values enforce stronger regularization towards uniform scaling across cells.
-    init_ncells : int, default=100000
+    init_ncells : int, default=10000
         Maximum number of cells to use for NNDSVD initialization. If the number of
         cells in the dataset exceeds this value, a random subset is used to compute
         the initialization, which speeds up startup time for large datasets.
@@ -882,36 +710,35 @@ def nmf(
     >>> # Access the results
     >>> print(adata.obsm["X_nmf"].shape)  # (1000, 32)
     """
-    m, n = adata.shape
+    m: int = adata.shape[0]
+    n: int = adata.shape[1]
 
     if batch_size is None:
         batch_size = m
+    batch_size = int(batch_size)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     v_init = None
     if init_method == "nndsvd":
         if not quiet:
             print("Computing NNDSVD initialization...")
 
-        # Subsample if dataset is too large
         X_init = adata.X
         if m > init_ncells:
             if not quiet:
                 print(f"Subsampling {init_ncells} cells for initialization...")
-            # Use fixed seed for reproducibility of initialization subset
             rng = np.random.default_rng(42)
             indices = rng.choice(m, init_ncells, replace=False)
             indices.sort()
             X_init = X_init[indices]
 
-        # Compute SVD
         U, S, Vt = svds(X_init, k=k)
-        # Sort by singular values descending
         idx = np.argsort(S)[::-1]
         S = S[idx]
         U = U[:, idx]
         Vt = Vt[idx, :]
 
-        # NNDSVD initialization for H (which becomes V in our model)
         H = np.zeros((k, n))
         for j in range(k):
             x = U[:, j]
@@ -932,19 +759,14 @@ def nmf(
                 v = yn * xnn * np.sqrt(S[j])
             H[j, :] = v
 
-        # Add small epsilon to avoid log(0) and zeros
         H = H + 1e-6
-        # Normalize rows to sum to 1 to match softmax expectation
         H_norm = H / H.sum(axis=1, keepdims=True)
-        # Inverse softmax (approximate) - just use log probabilities
-        v_init = jnp.array(np.log(H_norm))
+        v_init = np.log(H_norm).astype(np.float32)
 
-    rngs = nnx.Rngs(0)
     model = NMF(
         n,
         k,
         hidden_dim,
-        rngs=rngs,
         r_prior_alpha=r_prior_alpha,
         r_prior_beta=r_prior_beta,
         scale_prior_sigma=scale_prior_sigma,
@@ -954,112 +776,108 @@ def nmf(
         gene_scale_factors=gene_scale_factors,
         init_method=init_method,
         v_init=v_init,
-    )
+    ).to(device)
 
     if optimizer_name == "adam":
-        opt = optax.adam(lr)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     elif optimizer_name == "adamw":
-        opt = optax.adamw(lr)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     elif optimizer_name == "sgd":
-        opt = optax.sgd(lr, momentum=0.9)
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
     elif optimizer_name == "rmsprop":
-        opt = optax.rmsprop(lr)
+        optimizer = torch.optim.RMSprop(model.parameters(), lr=lr)
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
-    optimizer = nnx.Optimizer(model, opt, wrt=nnx.Param)
-    metrics = nnx.MultiMetric(neg_logprob=nnx.metrics.Average("neg_logprob"))
+    if likelihood == "nb":
+        loss_fn_sparse = neg_nb_logprob_sparse
+        loss_fn_dense = neg_nb_logprob_dense
+    elif likelihood == "poisson":
+        loss_fn_sparse = neg_poisson_logprob_sparse
+        loss_fn_dense = neg_poisson_logprob_dense
+    else:
+        raise ValueError(
+            f"Unknown likelihood: {likelihood}. Must be 'nb' or 'poisson'."
+        )
 
     X = adata.X
 
     if sparse:
-        batch_sampler = PaddedBCSRSampler(X, batch_size)
-        train_step = create_train_step_sparse(likelihood)
+        batch_sampler = SparseBatchSampler(X, batch_size, device)
+        train_loss_fn = loss_fn_sparse
     else:
-        batch_sampler = CSRMatrixRowSampler(X, batch_size)
-        train_step = create_train_step_dense(likelihood)
+        batch_sampler = DenseRowSampler(X, batch_size, device)
+        train_loss_fn = loss_fn_dense
 
     # Convergence tracking
     best_logprob = -float("inf")
     no_improvement_count = 0
 
+    model.train()
     with tqdm(range(max_epochs), desc="Training", unit="epoch", disable=quiet) as pbar:
         for epoch in pbar:
-            for X_batch in batch_sampler:
-                loss = train_step(model, optimizer, X_batch)
-                metrics.update(neg_logprob=loss)
+            epoch_loss_sum = 0.0
+            epoch_batch_count = 0
 
-            logprob = -metrics.compute()["neg_logprob"]
+            for X_batch in batch_sampler:
+                optimizer.zero_grad()
+                loss = train_loss_fn(model, X_batch)
+                loss.backward()
+                optimizer.step()
+                epoch_loss_sum += loss.detach().item()
+                epoch_batch_count += 1
+
+            logprob = -(epoch_loss_sum / epoch_batch_count)
 
             if not np.isfinite(logprob):
                 raise ValueError("Log-likelihood is not finite")
 
-            # Check for improvement
             if logprob - best_logprob > min_delta:
                 best_logprob = logprob
                 no_improvement_count = 0
             else:
                 no_improvement_count += 1
 
-            # Update progress bar
             pbar.set_postfix(
                 logprob=f"{logprob:.4f}",
                 best=f"{best_logprob:.4f}",
                 patience=f"{no_improvement_count}/{patience}",
             )
 
-            metrics.reset()
-
-            # Early stopping check
             if no_improvement_count >= patience:
                 pbar.write(
                     f"Early stopping at epoch {epoch + 1}: no improvement for {patience} epochs"
                 )
                 break
 
-    v = model.v_scaled()
-
     # Map entire X matrix through encoder in chunks
-    # Use smaller chunk size for output to avoid OOM with large batch_size
     output_chunk_size = min(batch_size, 1024)
     Xnmf = np.zeros((m, k), dtype=np.float32)
     scales = np.zeros(m, dtype=np.float32)
     ll = 0.0
 
-    # Select the appropriate likelihood function for final computation
-    if likelihood == "nb":
-        final_loss_fn = neg_nb_logprob_dense
-    elif likelihood == "poisson":
-        final_loss_fn = neg_poisson_logprob_dense
-    else:
-        raise ValueError(
-            f"Unknown likelihood: {likelihood}. Must be 'nb' or 'poisson'."
-        )
+    model.eval()
+    with torch.no_grad():
+        for start_idx in range(0, m, output_chunk_size):
+            end_idx = min(start_idx + output_chunk_size, m)
 
-    for start_idx in range(0, m, output_chunk_size):
-        end_idx = min(start_idx + output_chunk_size, m)
+            X_chunk = torch.tensor(
+                as_dense_f32(X[start_idx:end_idx, :]),
+                dtype=torch.float32,
+                device=device,
+            )
 
-        X_chunk = as_dense_f32(X[start_idx:end_idx, :])
-        X_chunk = jnp.array(X_chunk, dtype=jnp.float32)
+            encoded_chunk = model.encoder(X_chunk)
+            log_scale_chunk = model.scale_encoder(X_chunk).clamp(-10.0, 10.0)
 
-        # Get encoded representation
-        encoded_chunk = model.encoder(X_chunk)
+            ll += -loss_fn_dense(model, X_chunk, constant_terms=True).item()
 
-        # Predict log_scale using scale encoder (same as in model.__call__)
-        log_scale_chunk = model.scale_encoder(X_chunk)
-        log_scale_chunk = jnp.clip(log_scale_chunk, -10.0, 10.0)
+            Xnmf[start_idx:end_idx, :] = encoded_chunk.cpu().numpy()
+            scales[start_idx:end_idx] = torch.exp(log_scale_chunk).squeeze(1).cpu().numpy()
 
-        ll += -final_loss_fn(model, X_chunk, constant_terms=True)
-
-        Xnmf[start_idx:end_idx, :] = np.array(encoded_chunk)
-        scales[start_idx:end_idx] = np.squeeze(
-            np.array(jnp.exp(log_scale_chunk)), axis=1
-        )
-
-    # Store in AnnData object
     adata.obsm["X_nmf"] = Xnmf
     adata.obs["scale_nmf"] = scales
-    adata.varm["V_nmf"] = np.asarray(model.v_norm()).transpose()
+    adata.varm["V_nmf"] = model.v_norm().detach().cpu().numpy().T
     adata.uns["nmf_log_likelihood"] = float(ll)
 
     # Filter irrelevant metagenes
