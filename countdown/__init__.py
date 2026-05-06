@@ -10,36 +10,6 @@ from scipy.sparse.linalg import svds
 from tqdm import tqdm
 
 
-def _lgamma(x: torch.Tensor) -> torch.Tensor:
-    """
-    Log-gamma via Lanczos approximation (g=7, n=9).
-    Implemented with basic tensor ops to avoid NVRTC JIT compilation on CUDA.
-    Assumes x > 0 (which holds for all uses in this module).
-    """
-    _lanczos_p = torch.tensor(
-        [
-            0.99999999999980993,
-            676.5203681218851,
-            -1259.1392167224028,
-            771.32342877765313,
-            -176.61502916214059,
-            12.507343278686905,
-            -0.13857109526572012,
-            9.9843695780195716e-6,
-            1.5056327351493116e-7,
-        ],
-        dtype=x.dtype,
-        device=x.device,
-    )
-    g = 7.0
-    z = x - 1.0
-    t = z + g + 0.5
-    s = _lanczos_p[0]
-    for i in range(1, len(_lanczos_p)):
-        s = s + _lanczos_p[i] / (z + i)
-    return 0.5 * math.log(2.0 * math.pi) + (z + 0.5) * torch.log(t) - t + torch.log(s)
-
-
 def as_dense_f32(X: csr_matrix | np.ndarray) -> np.ndarray:
     if isinstance(X, csr_matrix):
         return np.asarray(X.todense()).astype(np.float32)
@@ -51,8 +21,9 @@ class SparseBatchSampler:
     """
     Samples batches of rows from a CSR matrix as torch sparse_csr_tensor objects.
 
-    Precomputes all batches at initialization (stored as numpy arrays in CPU memory),
-    then converts to torch.sparse_csr_tensor on demand during iteration.
+    Precomputes all batches at initialization as pinned CPU tensors (including
+    row indices for the loss function), then transfers to GPU during iteration
+    using non-blocking transfers for better CPU/GPU overlap.
     """
 
     def __init__(self, X: csr_matrix | np.ndarray, batch_size: int, device: torch.device):
@@ -63,34 +34,48 @@ class SparseBatchSampler:
         X = X.astype(np.float32)
         self.n = n
         self.device = device
+        use_pin = device.type == "cuda"
+
+        def _maybe_pin(t: torch.Tensor) -> torch.Tensor:
+            return t.pin_memory() if use_pin else t
 
         idx = np.arange(m)
         np.random.shuffle(idx)
 
-        self._batches: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]] = []
+        self._batches: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
         for fr in range(0, m, batch_size):
             to = min(fr + batch_size, m)
             batch_idx = idx[fr:to].copy()
             batch_idx.sort()
             sliced = X[batch_idx, :]
+
+            nnz_per_row = np.diff(sliced.indptr)
+            row_idx_np = np.repeat(np.arange(sliced.shape[0], dtype=np.int64), nnz_per_row)
+
             self._batches.append((
-                sliced.data.copy(),
-                sliced.indices.astype(np.int64),
-                sliced.indptr.astype(np.int64),
+                _maybe_pin(torch.from_numpy(sliced.data.copy())),
+                _maybe_pin(torch.from_numpy(sliced.indices.astype(np.int64))),
+                _maybe_pin(torch.from_numpy(sliced.indptr.astype(np.int64))),
+                _maybe_pin(torch.from_numpy(row_idx_np)),
                 sliced.shape[0],
             ))
 
     def __iter__(self):
+        nb = self.device.type == "cuda"
         with torch.sparse.check_sparse_tensor_invariants(enable=False):
-            for data, indices, indptr, batch_m in self._batches:
-                crow = torch.from_numpy(indptr).to(self.device)
-                col  = torch.from_numpy(indices).to(self.device)
-                vals = torch.from_numpy(data).to(self.device)
-                yield torch.sparse_csr_tensor(
-                    crow, col, vals,
-                    size=(batch_m, self.n),
-                    dtype=torch.float32,
-                    device=self.device,
+            for data, indices, indptr, row_idx, batch_m in self._batches:
+                crow = indptr.to(self.device, non_blocking=nb)
+                col  = indices.to(self.device, non_blocking=nb)
+                vals = data.to(self.device, non_blocking=nb)
+                row  = row_idx.to(self.device, non_blocking=nb)
+                yield (
+                    torch.sparse_csr_tensor(
+                        crow, col, vals,
+                        size=(batch_m, self.n),
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                    row,
                 )
 
 
@@ -114,7 +99,7 @@ class DenseRowSampler:
         for fr in range(0, self.m, self.batch_size):
             to = min(fr + self.batch_size, self.m)
             batch = self.X[self.idx[fr:to], :]
-            yield torch.tensor(batch, dtype=torch.float32, device=self.device)
+            yield torch.tensor(batch, dtype=torch.float32, device=self.device), None
 
 
 class SparseLinear(nn.Module):
@@ -335,8 +320,11 @@ class NMF(nn.Module):
 
     # X: [batch_size, n]
     def forward(self, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        u = self.encoder(X)                          # [batch_size, k]
-        log_scale = self.scale_encoder(X)            # [batch_size, 1]
+        if X.layout == torch.sparse_csr:
+            u, log_scale = self._fused_sparse_forward(X)
+        else:
+            u = self.encoder(X)
+            log_scale = self.scale_encoder(X)
         log_scale = log_scale.clamp(-10.0, 10.0)
         scale = torch.exp(log_scale)                 # [batch_size, 1]
         lambda_base = u @ self.v_scaled()            # [batch_size, n]
@@ -345,6 +333,45 @@ class NMF(nn.Module):
         else:
             lambda_scaled = lambda_base
         return lambda_scaled, u, log_scale
+
+    def _fused_sparse_forward(self, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Fuse all first-layer sparse matrix multiplications into one torch.sparse.mm call.
+        This reads X from memory only once instead of once per SparseLinear layer,
+        reducing memory bandwidth pressure for large sparse inputs.
+        """
+        enc = self.encoder
+        s1 = self.scale_encoder.layer1
+
+        if isinstance(enc, SimpleEncoder):
+            fused_w = torch.cat([enc.layer.weight, s1.weight], dim=1)
+            fused_b = torch.cat([enc.layer.bias, s1.bias])
+            k = enc.layer.weight.shape[1]
+            h = torch.sparse.mm(X, fused_w) + fused_b
+            u = F.softplus(h[:, :k])
+            log_scale = self.scale_encoder.layer2(F.softplus(h[:, k:]))
+
+        elif isinstance(enc, BoundedAuxiliaryEncoder):
+            fused_w = torch.cat([enc.direct.weight, enc.aux.weight, s1.weight], dim=1)
+            fused_b = torch.cat([enc.direct.bias, enc.aux.bias, s1.bias])
+            k = enc.direct.weight.shape[1]
+            h = torch.sparse.mm(X, fused_w) + fused_b
+            u = F.softplus(h[:, :k] + torch.tanh(h[:, k:2*k]))
+            log_scale = self.scale_encoder.layer2(F.softplus(h[:, 2*k:]))
+
+        elif isinstance(enc, (DeepSoftplusEncoder, DeepCompactEncoder)):
+            fused_w = torch.cat([enc.layer1.weight, s1.weight], dim=1)
+            fused_b = torch.cat([enc.layer1.bias, s1.bias])
+            hd = enc.layer1.weight.shape[1]
+            h = torch.sparse.mm(X, fused_w) + fused_b
+            u = F.softplus(enc.layer2(F.softplus(h[:, :hd])))
+            log_scale = self.scale_encoder.layer2(F.softplus(h[:, hd:]))
+
+        else:
+            u = enc(X)
+            log_scale = self.scale_encoder(X)
+
+        return u, log_scale
 
     def v_norm(self) -> torch.Tensor:
         return F.softmax(self.v, dim=1)
@@ -519,78 +546,79 @@ def _sparse_row_col_indices(
     return row_idx, col_idx
 
 
-def neg_poisson_logprob_dense(model: NMF, X: torch.Tensor, constant_terms: bool = False):
+def neg_poisson_logprob_dense(model: NMF, X: torch.Tensor, constant_terms: bool = False, row_idx: torch.Tensor | None = None):
     """Negative log posterior for dense input under Poisson likelihood."""
     λ, u, log_scale = model(X)
     lp = (X * torch.log(λ.clamp(1e-8))).sum() - λ.sum()
     if constant_terms:
-        lp -= _lgamma(X + 1).sum()
+        lp -= torch.lgamma(X + 1).sum()
     return -lp + model.log_prior(u, log_scale)
 
 
-def neg_poisson_logprob_sparse(model: NMF, X: torch.Tensor, constant_terms: bool = False):
+def neg_poisson_logprob_sparse(model: NMF, X: torch.Tensor, constant_terms: bool = False, row_idx: torch.Tensor | None = None):
     """Negative log posterior for sparse CSR input under Poisson likelihood."""
     λ, u, log_scale = model(X)
-    row_idx, col_idx = _sparse_row_col_indices(X)
+    col_idx = X.col_indices()
+    if row_idx is None:
+        row_idx, col_idx = _sparse_row_col_indices(X)
     x_data = X.values()
     lp = (x_data * torch.log(λ[row_idx, col_idx].clamp(1e-8))).sum() - λ.sum()
     if constant_terms:
-        lp -= _lgamma(x_data + 1).sum()
+        lp -= torch.lgamma(x_data + 1).sum()
     return -lp + model.log_prior(u, log_scale)
 
 
-def neg_nb_logprob_dense(model: NMF, X: torch.Tensor, constant_terms: bool = False):
+def neg_nb_logprob_dense(model: NMF, X: torch.Tensor, constant_terms: bool = False, row_idx: torch.Tensor | None = None):
     """Negative log posterior for dense input under Negative Binomial likelihood."""
     λ, u, log_scale = model(X)
     r = model.r().unsqueeze(0)        # [1, n]
     log_r = model.log_r.unsqueeze(0)  # [1, n]
     log_λr = torch.log(λ + r)
     log_λ = torch.log(λ)
-    gammaln_r = _lgamma(r)  # [1, n]
 
     ncells = X.shape[0]
 
-    lp = -(ncells * gammaln_r).sum()
+    lp = -(ncells * torch.lgamma(r)).sum()
     lp += (ncells * r * log_r).sum()
     lp -= (r * log_λr.sum(dim=0, keepdim=True)).sum()
     lp += (X * (log_λ - log_λr)).sum()
-    lp += _lgamma(X + r).sum()
+    lp += torch.lgamma(X + r).sum()
 
     if constant_terms:
-        lp -= _lgamma(X + 1).sum()
+        lp -= torch.lgamma(X + 1).sum()
 
     return -lp + model.log_prior(u, log_scale)
 
 
-def neg_nb_logprob_sparse(model: NMF, X: torch.Tensor, constant_terms: bool = False):
+def neg_nb_logprob_sparse(model: NMF, X: torch.Tensor, constant_terms: bool = False, row_idx: torch.Tensor | None = None):
     """Negative log posterior for sparse CSR input under Negative Binomial likelihood."""
     λ, u, log_scale = model(X)
     r = model.r().unsqueeze(0)        # [1, n]
     log_r = model.log_r.unsqueeze(0)  # [1, n]
     log_λr = torch.log(λ + r)
     log_λ = torch.log(λ)
-    gammaln_r = _lgamma(r)  # [1, n]
 
     ncells = X.shape[0]
-    row_idx, col_idx = _sparse_row_col_indices(X)
+    col_idx = X.col_indices()
+    if row_idx is None:
+        row_idx, col_idx = _sparse_row_col_indices(X)
     x_data = X.values()
 
-    lp = -(ncells * gammaln_r).sum()
-    lp += (ncells * r * log_r).sum()
+    lp = (ncells * r * log_r).sum()
     lp -= (r * log_λr.sum(dim=0, keepdim=True)).sum()
 
     # X * (log_λ - log_λr) at non-zero positions only
     log_diff = log_λ - log_λr
     lp += (x_data * log_diff[row_idx, col_idx]).sum()
 
-    # gammaln(X + r) trick: avoids densifying X
-    # full sum over gammaln(r) per cell, then correct at non-zero positions
-    lp += (ncells * gammaln_r).sum()
-    lp -= gammaln_r[0, col_idx].sum()
-    lp += _lgamma(r[0, col_idx] + x_data).sum()
+    # gammaln(X + r) - gammaln(r) at non-zero positions only.
+    # At zero positions, lgamma(0 + r) - lgamma(r) = 0, so these contribute nothing.
+    r_col = r[0, col_idx]
+    lp -= torch.lgamma(r_col).sum()
+    lp += torch.lgamma(r_col + x_data).sum()
 
     if constant_terms:
-        lp -= _lgamma(x_data + 1).sum()
+        lp -= torch.lgamma(x_data + 1).sum()
 
     return -lp + model.log_prior(u, log_scale)
 
@@ -819,9 +847,9 @@ def nmf(
             epoch_loss_sum = 0.0
             epoch_batch_count = 0
 
-            for X_batch in batch_sampler:
-                optimizer.zero_grad()
-                loss = train_loss_fn(model, X_batch)
+            for X_batch, precomputed_row_idx in batch_sampler:
+                optimizer.zero_grad(set_to_none=True)
+                loss = train_loss_fn(model, X_batch, row_idx=precomputed_row_idx)
                 loss.backward()
                 optimizer.step()
                 epoch_loss_sum += loss.detach().item()
