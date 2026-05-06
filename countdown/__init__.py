@@ -1,4 +1,5 @@
 import math
+import warnings
 
 import numpy as np
 import torch
@@ -8,6 +9,15 @@ from anndata import AnnData
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import svds
 from tqdm import tqdm
+
+# PyTorch labels the CSR tensor Python API "beta" for API-stability reasons; the
+# underlying cuSPARSE kernels are production-grade and the API hasn't changed since
+# PyTorch 1.11. Suppress the noise.
+warnings.filterwarnings(
+    "ignore",
+    message="Sparse CSR tensor support is in beta state",
+    category=UserWarning,
+)
 
 
 def as_dense_f32(X: csr_matrix | np.ndarray) -> np.ndarray:
