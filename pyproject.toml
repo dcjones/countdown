@@ -24,4 +24,5 @@ build-backend = "poetry.core.masonry.api"
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
+    "scikit-learn>=1.9.0",
 ]

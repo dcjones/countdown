@@ -41,20 +41,36 @@ class SparseBatchSampler:
             from scipy.sparse import csr_matrix as make_csr
             X = make_csr(X)
         m, n = X.shape
-        X = X.astype(np.float32)
+        self.X = X.astype(np.float32)
+        self.m = m
         self.n = n
+        self.batch_size = batch_size
         self.device = device
-        use_pin = device.type == "cuda"
+        self.use_pin = device.type == "cuda"
+        self._batches: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
+        self.shuffle()
+
+    def shuffle(self) -> None:
+        """Rebuild the batched pre-sliced CPU tensors with a fresh row permutation.
+
+        Called once at construction and once per epoch by the training loop so
+        that batch order/composition varies across epochs, mirroring
+        DenseRowSampler. Keeping the per-batch CSR slices precomputed on the
+        CPU (pinned when on CUDA) preserves the cheap non-blocking transfer
+        path while still reshuffling between epochs.
+        """
+        X = self.X
+        use_pin = self.use_pin
 
         def _maybe_pin(t: torch.Tensor) -> torch.Tensor:
             return t.pin_memory() if use_pin else t
 
-        idx = np.arange(m)
+        idx = np.arange(self.m)
         np.random.shuffle(idx)
 
-        self._batches: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
-        for fr in range(0, m, batch_size):
-            to = min(fr + batch_size, m)
+        self._batches = []
+        for fr in range(0, self.m, self.batch_size):
+            to = min(fr + self.batch_size, self.m)
             batch_idx = idx[fr:to].copy()
             batch_idx.sort()
             sliced = X[batch_idx, :]
@@ -502,7 +518,12 @@ class NMF(nn.Module):
         else:
             return torch.zeros(1, device=self.v.device).squeeze()
 
-    def log_prior(self, u: torch.Tensor, log_scale: torch.Tensor) -> torch.Tensor:
+    def log_prior(
+        self,
+        u: torch.Tensor,
+        log_scale: torch.Tensor,
+        r_weight: float = 1.0,
+    ) -> torch.Tensor:
         """
         Compute log prior for all parameters.
 
@@ -514,6 +535,13 @@ class NMF(nn.Module):
         Args:
             u: [batch_size, k] metagene usage for current batch
             log_scale: [batch_size, 1] log scale values for current batch
+            r_weight: Scaling for the per-gene dispersion (r) prior term. The r
+                prior is a single per-gene term independent of the cells in the
+                batch, so under per-batch SGD it must be weighted by 1/n_batches
+                to be applied exactly once per epoch (otherwise the effective
+                prior strength scales with the number of minibatches). The
+                cell-specific scale prior and the metagene regularizer are
+                already cell/batch-local and are NOT scaled.
 
         Returns negative log prior (to be minimized).
         """
@@ -527,7 +555,7 @@ class NMF(nn.Module):
             + (alpha - 1) * torch.log(r)
             - beta * r
         )
-        neg_log_prior = -log_prior_r.sum()
+        neg_log_prior = -log_prior_r.sum() * r_weight
 
         sigma = self.scale_prior_sigma
         log_prior_scale = (
@@ -556,16 +584,16 @@ def _sparse_row_col_indices(
     return row_idx, col_idx
 
 
-def neg_poisson_logprob_dense(model: NMF, X: torch.Tensor, constant_terms: bool = False, row_idx: torch.Tensor | None = None):
+def neg_poisson_logprob_dense(model: NMF, X: torch.Tensor, constant_terms: bool = False, row_idx: torch.Tensor | None = None, r_weight: float = 1.0):
     """Negative log posterior for dense input under Poisson likelihood."""
     λ, u, log_scale = model(X)
     lp = (X * torch.log(λ.clamp(1e-8))).sum() - λ.sum()
     if constant_terms:
         lp -= torch.lgamma(X + 1).sum()
-    return -lp + model.log_prior(u, log_scale)
+    return -lp + model.log_prior(u, log_scale, r_weight=r_weight)
 
 
-def neg_poisson_logprob_sparse(model: NMF, X: torch.Tensor, constant_terms: bool = False, row_idx: torch.Tensor | None = None):
+def neg_poisson_logprob_sparse(model: NMF, X: torch.Tensor, constant_terms: bool = False, row_idx: torch.Tensor | None = None, r_weight: float = 1.0):
     """Negative log posterior for sparse CSR input under Poisson likelihood."""
     λ, u, log_scale = model(X)
     col_idx = X.col_indices()
@@ -575,10 +603,10 @@ def neg_poisson_logprob_sparse(model: NMF, X: torch.Tensor, constant_terms: bool
     lp = (x_data * torch.log(λ[row_idx, col_idx].clamp(1e-8))).sum() - λ.sum()
     if constant_terms:
         lp -= torch.lgamma(x_data + 1).sum()
-    return -lp + model.log_prior(u, log_scale)
+    return -lp + model.log_prior(u, log_scale, r_weight=r_weight)
 
 
-def neg_nb_logprob_dense(model: NMF, X: torch.Tensor, constant_terms: bool = False, row_idx: torch.Tensor | None = None):
+def neg_nb_logprob_dense(model: NMF, X: torch.Tensor, constant_terms: bool = False, row_idx: torch.Tensor | None = None, r_weight: float = 1.0):
     """Negative log posterior for dense input under Negative Binomial likelihood."""
     λ, u, log_scale = model(X)
     r = model.r().unsqueeze(0)        # [1, n]
@@ -597,10 +625,10 @@ def neg_nb_logprob_dense(model: NMF, X: torch.Tensor, constant_terms: bool = Fal
     if constant_terms:
         lp -= torch.lgamma(X + 1).sum()
 
-    return -lp + model.log_prior(u, log_scale)
+    return -lp + model.log_prior(u, log_scale, r_weight=r_weight)
 
 
-def neg_nb_logprob_sparse(model: NMF, X: torch.Tensor, constant_terms: bool = False, row_idx: torch.Tensor | None = None):
+def neg_nb_logprob_sparse(model: NMF, X: torch.Tensor, constant_terms: bool = False, row_idx: torch.Tensor | None = None, r_weight: float = 1.0):
     """Negative log posterior for sparse CSR input under Negative Binomial likelihood."""
     λ, u, log_scale = model(X)
     r = model.r().unsqueeze(0)        # [1, n]
@@ -630,7 +658,7 @@ def neg_nb_logprob_sparse(model: NMF, X: torch.Tensor, constant_terms: bool = Fa
     if constant_terms:
         lp -= torch.lgamma(x_data + 1).sum()
 
-    return -lp + model.log_prior(u, log_scale)
+    return -lp + model.log_prior(u, log_scale, r_weight=r_weight)
 
 
 def nmf(
@@ -657,6 +685,10 @@ def nmf(
     quiet: bool = False,
     filter_min_prop: float = 1e-5,
     filter_min_delta: float = 1.0,
+    grad_clip: float | None = 1.0,
+    lr_schedule: str = "cosine",
+    lr_warmup_epochs: int = 10,
+    lr_warmup_start: float = 1e-4,
 ):
     """
     Perform Non-negative Matrix Factorization (NMF) on genomic count data.
@@ -847,6 +879,53 @@ def nmf(
         batch_sampler = DenseRowSampler(X, batch_size, device)
         train_loss_fn = loss_fn_dense
 
+    # The per-gene dispersion (r) prior is a single dataset-level term (independent
+    # of which cells are in a batch). Under per-batch SGD it would otherwise be
+    # applied once per minibatch, inflating its effective strength by n_batches.
+    # Weight it by 1/n_batches so it accumulates to exactly one prior per epoch.
+    n_batches = (m + batch_size - 1) // batch_size
+    r_weight_train = 1.0 / n_batches
+
+    # Learning-rate schedule. Empirically (see CLAUDE.md) cosine decay paired with
+    # gradient clipping is the most stable configuration; cosine without clipping
+    # is harmful, and clipping alone helps over no-schedule/no-clip. "none"
+    # keeps a constant lr (recoverable for A/B tests).
+    total_steps = max_epochs * n_batches
+    scheduler = None
+    if lr_schedule == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max_epochs, eta_min=lr * 1e-3
+        )
+    elif lr_schedule == "cosine_warmup":
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[
+                torch.optim.lr_scheduler.LinearLR(
+                    optimizer,
+                    start_factor=lr_warmup_start / lr,
+                    end_factor=1.0,
+                    total_iters=lr_warmup_epochs,
+                ),
+                torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=max_epochs - lr_warmup_epochs,
+                    eta_min=lr * 1e-3,
+                ),
+            ],
+            milestones=[lr_warmup_epochs],
+        )
+    elif lr_schedule == "reduce_on_plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", factor=0.5, patience=10, min_lr=lr * 1e-3
+        )
+    elif lr_schedule == "none":
+        scheduler = None
+    else:
+        raise ValueError(
+            f"Unknown lr_schedule: {lr_schedule}. Must be one of: 'cosine', "
+            f"'cosine_warmup', 'reduce_on_plateau', 'none'."
+        )
+
     # Convergence tracking
     best_logprob = -float("inf")
     no_improvement_count = 0
@@ -857,10 +936,19 @@ def nmf(
             epoch_loss_sum = 0.0
             epoch_batch_count = 0
 
+            # Reshuffle batch order each epoch so SGD sees varied minibatch
+            # compositions (DenseRowSampler already does this in __iter__).
+            if sparse:
+                batch_sampler.shuffle()
+
             for X_batch, precomputed_row_idx in batch_sampler:
                 optimizer.zero_grad(set_to_none=True)
-                loss = train_loss_fn(model, X_batch, row_idx=precomputed_row_idx)
+                loss = train_loss_fn(
+                    model, X_batch, row_idx=precomputed_row_idx, r_weight=r_weight_train
+                )
                 loss.backward()
+                if grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
                 epoch_loss_sum += loss.detach().item()
                 epoch_batch_count += 1
@@ -869,6 +957,12 @@ def nmf(
 
             if not np.isfinite(logprob):
                 raise ValueError("Log-likelihood is not finite")
+
+            # Step LR scheduler once per epoch.
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(logprob)
+            elif scheduler is not None:
+                scheduler.step()
 
             if logprob - best_logprob > min_delta:
                 best_logprob = logprob
@@ -880,6 +974,7 @@ def nmf(
                 logprob=f"{logprob:.4f}",
                 best=f"{best_logprob:.4f}",
                 patience=f"{no_improvement_count}/{patience}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2g}",
             )
 
             if no_improvement_count >= patience:
@@ -890,6 +985,11 @@ def nmf(
 
     # Map entire X matrix through encoder in chunks
     output_chunk_size = min(batch_size, 1024)
+    # Same r-prior weighting rationale as training: the dense loss adds a full
+    # per-gene r-prior per chunk, so the eval log-likelihood would otherwise
+    # double-count the dispersion prior (n_eval_chunks)x.
+    n_eval_chunks = (m + output_chunk_size - 1) // output_chunk_size
+    r_weight_eval = 1.0 / n_eval_chunks
     Xnmf = np.zeros((m, k), dtype=np.float32)
     scales = np.zeros(m, dtype=np.float32)
     ll = 0.0
@@ -908,7 +1008,9 @@ def nmf(
             encoded_chunk = model.encoder(X_chunk)
             log_scale_chunk = model.scale_encoder(X_chunk).clamp(-10.0, 10.0)
 
-            ll += -loss_fn_dense(model, X_chunk, constant_terms=True).item()
+            ll += -loss_fn_dense(
+                model, X_chunk, constant_terms=True, r_weight=r_weight_eval
+            ).item()
 
             Xnmf[start_idx:end_idx, :] = encoded_chunk.cpu().numpy()
             scales[start_idx:end_idx] = torch.exp(log_scale_chunk).squeeze(1).cpu().numpy()
