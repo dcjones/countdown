@@ -668,15 +668,15 @@ def nmf(
     hidden_dim=512,
     lr=1e-2,
     max_epochs: int = 2000,
-    patience: int = 40,
+    patience: int = 80,
     min_delta: float = 1e-5,
     sparse: bool = True,
     likelihood: str = "nb",
     r_prior_alpha: float = 2.0,
     r_prior_beta: float = 2.0,
-    scale_prior_sigma: float = 0.1,
-    encoder_version: str = "bounded_auxiliary",
-    metagene_reg_type: str = "none",
+    scale_prior_sigma: float = 0.5,
+    encoder_version: str = "simple",
+    metagene_reg_type: str = "correlation",
     metagene_reg_strength: float = 0.01,
     gene_scale_factors: bool = True,
     init_method: str = "nndsvd",
@@ -714,8 +714,11 @@ def nmf(
         Learning rate for the Adam optimizer.
     max_epochs : int, default=2000
         Maximum number of training epochs.
-    patience : int, default=40
+    patience : int, default=80
         Number of epochs to wait for improvement before early stopping.
+        Larger values allow more complex encoders (e.g. bounded_auxiliary,
+        deep_softplus) to converge; short patience was found to
+        under-train complex encoders relative to the simple encoder.
     min_delta : float, default=1e-5
         Minimum change in log-probability to be considered an improvement
         for early stopping.
@@ -732,7 +735,7 @@ def nmf(
         Rate parameter (beta) for the Gamma prior on dispersion parameters r.
         For Gamma(alpha, beta), the mean is alpha/beta and mode is (alpha-1)/beta.
         Larger values push the prior towards smaller r values.
-    scale_prior_sigma : float, default=0.1
+    scale_prior_sigma : float, default=0.5
         Standard deviation for the Normal(0, sigma) prior on log scale values.
         Cell-specific scale factors are learned by the encoder using exp transformation.
         Smaller sigma values enforce stronger regularization towards uniform scaling across cells.
