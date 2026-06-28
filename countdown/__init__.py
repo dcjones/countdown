@@ -36,9 +36,12 @@ class SparseBatchSampler:
     using non-blocking transfers for better CPU/GPU overlap.
     """
 
-    def __init__(self, X: csr_matrix | np.ndarray, batch_size: int, device: torch.device):
+    def __init__(
+        self, X: csr_matrix | np.ndarray, batch_size: int, device: torch.device
+    ):
         if not isinstance(X, csr_matrix):
             from scipy.sparse import csr_matrix as make_csr
+
             X = make_csr(X)
         m, n = X.shape
         self.X = X.astype(np.float32)
@@ -47,7 +50,9 @@ class SparseBatchSampler:
         self.batch_size = batch_size
         self.device = device
         self.use_pin = device.type == "cuda"
-        self._batches: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
+        self._batches: list[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]
+        ] = []
         self.shuffle()
 
     def shuffle(self) -> None:
@@ -76,27 +81,33 @@ class SparseBatchSampler:
             sliced = X[batch_idx, :]
 
             nnz_per_row = np.diff(sliced.indptr)
-            row_idx_np = np.repeat(np.arange(sliced.shape[0], dtype=np.int64), nnz_per_row)
+            row_idx_np = np.repeat(
+                np.arange(sliced.shape[0], dtype=np.int64), nnz_per_row
+            )
 
-            self._batches.append((
-                _maybe_pin(torch.from_numpy(sliced.data.copy())),
-                _maybe_pin(torch.from_numpy(sliced.indices.astype(np.int64))),
-                _maybe_pin(torch.from_numpy(sliced.indptr.astype(np.int64))),
-                _maybe_pin(torch.from_numpy(row_idx_np)),
-                sliced.shape[0],
-            ))
+            self._batches.append(
+                (
+                    _maybe_pin(torch.from_numpy(sliced.data.copy())),
+                    _maybe_pin(torch.from_numpy(sliced.indices.astype(np.int64))),
+                    _maybe_pin(torch.from_numpy(sliced.indptr.astype(np.int64))),
+                    _maybe_pin(torch.from_numpy(row_idx_np)),
+                    sliced.shape[0],
+                )
+            )
 
     def __iter__(self):
         nb = self.device.type == "cuda"
         with torch.sparse.check_sparse_tensor_invariants(enable=False):
             for data, indices, indptr, row_idx, batch_m in self._batches:
                 crow = indptr.to(self.device, non_blocking=nb)
-                col  = indices.to(self.device, non_blocking=nb)
+                col = indices.to(self.device, non_blocking=nb)
                 vals = data.to(self.device, non_blocking=nb)
-                row  = row_idx.to(self.device, non_blocking=nb)
+                row = row_idx.to(self.device, non_blocking=nb)
                 yield (
                     torch.sparse_csr_tensor(
-                        crow, col, vals,
+                        crow,
+                        col,
+                        vals,
                         size=(batch_m, self.n),
                         dtype=torch.float32,
                         device=self.device,
@@ -108,7 +119,9 @@ class SparseBatchSampler:
 class DenseRowSampler:
     """Samples random batches of rows from a CSR or dense matrix, yielding dense tensors."""
 
-    def __init__(self, X: csr_matrix | np.ndarray, batch_size: int, device: torch.device):
+    def __init__(
+        self, X: csr_matrix | np.ndarray, batch_size: int, device: torch.device
+    ):
         if isinstance(X, csr_matrix):
             X = np.asarray(X.todense()).astype(np.float32)
         else:
@@ -284,6 +297,7 @@ class NMF(nn.Module):
         hidden_dim: int,
         r_prior_alpha: float = 2.0,
         r_prior_beta: float = 2.0,
+        fixed_r: float | None = None,
         scale_prior_sigma: float = 0.5,
         encoder_version: str = "simple",
         metagene_reg_type: str = "none",
@@ -333,7 +347,19 @@ class NMF(nn.Module):
         else:
             raise ValueError(f"Unknown init_method: {init_method}")
 
-        self.log_r = nn.Parameter(torch.full((n,), 1e-1))
+        # Per-gene dispersion. When fixed_r is given, r is held constant at that
+        # value (stored as a non-trainable buffer) and its Gamma prior is dropped:
+        # this provides uniform NB "slack" without letting the model adapt
+        # dispersion to explain away structured residuals. Otherwise log_r is a
+        # trainable parameter with the Gamma(alpha, beta) prior in log_prior().
+        if fixed_r is not None:
+            if fixed_r <= 0:
+                raise ValueError(f"fixed_r must be positive, got {fixed_r}")
+            self.fixed_r = True
+            self.register_buffer("log_r", torch.full((n,), math.log(fixed_r)))
+        else:
+            self.fixed_r = False
+            self.log_r = nn.Parameter(torch.full((n,), 1e-1))
         self.scale_encoder = ScaleEncoder(n)
 
         # Store prior hyperparameters (not trainable)
@@ -345,22 +371,26 @@ class NMF(nn.Module):
         self.gene_scale_factors = gene_scale_factors
 
     # X: [batch_size, n]
-    def forward(self, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, X: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if X.layout == torch.sparse_csr:
             u, log_scale = self._fused_sparse_forward(X)
         else:
             u = self.encoder(X)
             log_scale = self.scale_encoder(X)
         log_scale = log_scale.clamp(-10.0, 10.0)
-        scale = torch.exp(log_scale)                 # [batch_size, 1]
-        lambda_base = u @ self.v_scaled()            # [batch_size, n]
+        scale = torch.exp(log_scale)  # [batch_size, 1]
+        lambda_base = u @ self.v_scaled()  # [batch_size, n]
         if self.gene_scale_factors:
             lambda_scaled = lambda_base * scale
         else:
             lambda_scaled = lambda_base
         return lambda_scaled, u, log_scale
 
-    def _fused_sparse_forward(self, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _fused_sparse_forward(
+        self, X: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Fuse all first-layer sparse matrix multiplications into one torch.sparse.mm call.
         This reads X from memory only once instead of once per SparseLinear layer,
@@ -382,8 +412,8 @@ class NMF(nn.Module):
             fused_b = torch.cat([enc.direct.bias, enc.aux.bias, s1.bias])
             k = enc.direct.weight.shape[1]
             h = torch.sparse.mm(X, fused_w) + fused_b
-            u = F.softplus(h[:, :k] + torch.tanh(h[:, k:2*k]))
-            log_scale = self.scale_encoder.layer2(F.softplus(h[:, 2*k:]))
+            u = F.softplus(h[:, :k] + torch.tanh(h[:, k : 2 * k]))
+            log_scale = self.scale_encoder.layer2(F.softplus(h[:, 2 * k :]))
 
         elif isinstance(enc, (DeepSoftplusEncoder, DeepCompactEncoder)):
             fused_w = torch.cat([enc.layer1.weight, s1.weight], dim=1)
@@ -424,7 +454,7 @@ class NMF(nn.Module):
 
         if self.metagene_reg_type == "correlation":
             v_centered = v_norm - v_norm.mean(dim=1, keepdim=True)
-            row_norms = torch.sqrt((v_centered ** 2).sum(dim=1, keepdim=True))
+            row_norms = torch.sqrt((v_centered**2).sum(dim=1, keepdim=True))
             v_normalized = v_centered / (row_norms + 1e-8)
             corr_matrix = v_normalized @ v_normalized.T  # [k, k]
             k = corr_matrix.shape[0]
@@ -440,7 +470,7 @@ class NMF(nn.Module):
             return self.metagene_reg_strength * penalty
 
         elif self.metagene_reg_type == "cosine":
-            row_norms = torch.sqrt((v_norm ** 2).sum(dim=1, keepdim=True))
+            row_norms = torch.sqrt((v_norm**2).sum(dim=1, keepdim=True))
             v_unit = v_norm / (row_norms + 1e-8)
             cosine_sim = v_unit @ v_unit.T  # [k, k]
             k = cosine_sim.shape[0]
@@ -467,7 +497,7 @@ class NMF(nn.Module):
             gene_weights = gene_variance / (gene_variance.sum() + 1e-8)
             v_weighted = v_norm * torch.sqrt(gene_weights)
             v_centered = v_weighted - v_weighted.mean(dim=1, keepdim=True)
-            row_norms = torch.sqrt((v_centered ** 2).sum(dim=1, keepdim=True))
+            row_norms = torch.sqrt((v_centered**2).sum(dim=1, keepdim=True))
             v_normalized = v_centered / (row_norms + 1e-8)
             corr_matrix = v_normalized @ v_normalized.T
             k = corr_matrix.shape[0]
@@ -481,7 +511,7 @@ class NMF(nn.Module):
             gene_weights = gene_variance / (gene_variance.sum() + 1e-8)
             v_weighted = v_norm * torch.sqrt(gene_weights)
             v_centered = v_weighted - v_weighted.mean(dim=1, keepdim=True)
-            row_norms = torch.sqrt((v_centered ** 2).sum(dim=1, keepdim=True))
+            row_norms = torch.sqrt((v_centered**2).sum(dim=1, keepdim=True))
             v_normalized = v_centered / (row_norms + 1e-8)
             corr_matrix = v_normalized @ v_normalized.T
             k = corr_matrix.shape[0]
@@ -501,7 +531,7 @@ class NMF(nn.Module):
             gene_weights = gene_variance / (gene_variance.sum() + 1e-8)
             v_weighted = v_norm * torch.sqrt(gene_weights)
             v_centered = v_weighted - v_weighted.mean(dim=1, keepdim=True)
-            row_norms = torch.sqrt((v_centered ** 2).sum(dim=1, keepdim=True))
+            row_norms = torch.sqrt((v_centered**2).sum(dim=1, keepdim=True))
             v_normalized = v_centered / (row_norms + 1e-8)
             corr_matrix = v_normalized @ v_normalized.T
             k = corr_matrix.shape[0]
@@ -513,7 +543,9 @@ class NMF(nn.Module):
             entropy = -(u_prob * torch.log(u_prob + 1e-8)).sum()
             max_entropy = math.log(float(u.shape[1]))
             entropy_penalty = max_entropy - entropy
-            return self.metagene_reg_strength * (corr_penalty + 1_000_000.0 * entropy_penalty)
+            return self.metagene_reg_strength * (
+                corr_penalty + 1_000_000.0 * entropy_penalty
+            )
 
         else:
             return torch.zeros(1, device=self.v.device).squeeze()
@@ -528,7 +560,8 @@ class NMF(nn.Module):
         Compute log prior for all parameters.
 
         Currently implements:
-        - Gamma(alpha, beta) prior on dispersion parameters r
+        - Gamma(alpha, beta) prior on dispersion parameters r (skipped entirely
+          when r is fixed, i.e. self.fixed_r is True)
         - Normal(0, sigma) prior on scale_logit (cell-specific scale factors)
         - Optional metagene regularization (correlation, orthogonal, or cosine)
 
@@ -545,23 +578,27 @@ class NMF(nn.Module):
 
         Returns negative log prior (to be minimized).
         """
-        r = self.r()
-        alpha = self.r_prior_alpha
-        beta = self.r_prior_beta
+        if self.fixed_r:
+            # r is held constant; it carries no prior and no gradient.
+            neg_log_prior = torch.zeros((), device=self.v.device)
+        else:
+            r = self.r()
+            alpha = self.r_prior_alpha
+            beta = self.r_prior_beta
 
-        log_prior_r = (
-            alpha * math.log(beta)
-            - math.lgamma(alpha)
-            + (alpha - 1) * torch.log(r)
-            - beta * r
-        )
-        neg_log_prior = -log_prior_r.sum() * r_weight
+            log_prior_r = (
+                alpha * math.log(beta)
+                - math.lgamma(alpha)
+                + (alpha - 1) * torch.log(r)
+                - beta * r
+            )
+            neg_log_prior = -log_prior_r.sum() * r_weight
 
         sigma = self.scale_prior_sigma
         log_prior_scale = (
             -0.5 * math.log(2 * math.pi)
             - math.log(sigma)
-            - log_scale ** 2 / (2 * sigma ** 2)
+            - log_scale**2 / (2 * sigma**2)
         )
         neg_log_prior = neg_log_prior - log_prior_scale.sum()
 
@@ -584,7 +621,13 @@ def _sparse_row_col_indices(
     return row_idx, col_idx
 
 
-def neg_poisson_logprob_dense(model: NMF, X: torch.Tensor, constant_terms: bool = False, row_idx: torch.Tensor | None = None, r_weight: float = 1.0):
+def neg_poisson_logprob_dense(
+    model: NMF,
+    X: torch.Tensor,
+    constant_terms: bool = False,
+    row_idx: torch.Tensor | None = None,
+    r_weight: float = 1.0,
+):
     """Negative log posterior for dense input under Poisson likelihood."""
     λ, u, log_scale = model(X)
     lp = (X * torch.log(λ.clamp(1e-8))).sum() - λ.sum()
@@ -593,7 +636,13 @@ def neg_poisson_logprob_dense(model: NMF, X: torch.Tensor, constant_terms: bool 
     return -lp + model.log_prior(u, log_scale, r_weight=r_weight)
 
 
-def neg_poisson_logprob_sparse(model: NMF, X: torch.Tensor, constant_terms: bool = False, row_idx: torch.Tensor | None = None, r_weight: float = 1.0):
+def neg_poisson_logprob_sparse(
+    model: NMF,
+    X: torch.Tensor,
+    constant_terms: bool = False,
+    row_idx: torch.Tensor | None = None,
+    r_weight: float = 1.0,
+):
     """Negative log posterior for sparse CSR input under Poisson likelihood."""
     λ, u, log_scale = model(X)
     col_idx = X.col_indices()
@@ -606,10 +655,16 @@ def neg_poisson_logprob_sparse(model: NMF, X: torch.Tensor, constant_terms: bool
     return -lp + model.log_prior(u, log_scale, r_weight=r_weight)
 
 
-def neg_nb_logprob_dense(model: NMF, X: torch.Tensor, constant_terms: bool = False, row_idx: torch.Tensor | None = None, r_weight: float = 1.0):
+def neg_nb_logprob_dense(
+    model: NMF,
+    X: torch.Tensor,
+    constant_terms: bool = False,
+    row_idx: torch.Tensor | None = None,
+    r_weight: float = 1.0,
+):
     """Negative log posterior for dense input under Negative Binomial likelihood."""
     λ, u, log_scale = model(X)
-    r = model.r().unsqueeze(0)        # [1, n]
+    r = model.r().unsqueeze(0)  # [1, n]
     log_r = model.log_r.unsqueeze(0)  # [1, n]
     log_λr = torch.log(λ + r)
     log_λ = torch.log(λ)
@@ -628,10 +683,16 @@ def neg_nb_logprob_dense(model: NMF, X: torch.Tensor, constant_terms: bool = Fal
     return -lp + model.log_prior(u, log_scale, r_weight=r_weight)
 
 
-def neg_nb_logprob_sparse(model: NMF, X: torch.Tensor, constant_terms: bool = False, row_idx: torch.Tensor | None = None, r_weight: float = 1.0):
+def neg_nb_logprob_sparse(
+    model: NMF,
+    X: torch.Tensor,
+    constant_terms: bool = False,
+    row_idx: torch.Tensor | None = None,
+    r_weight: float = 1.0,
+):
     """Negative log posterior for sparse CSR input under Negative Binomial likelihood."""
     λ, u, log_scale = model(X)
-    r = model.r().unsqueeze(0)        # [1, n]
+    r = model.r().unsqueeze(0)  # [1, n]
     log_r = model.log_r.unsqueeze(0)  # [1, n]
     log_λr = torch.log(λ + r)
     log_λ = torch.log(λ)
@@ -671,9 +732,10 @@ def nmf(
     patience: int = 80,
     min_delta: float = 1e-5,
     sparse: bool = True,
-    likelihood: str = "nb",
+    likelihood: str = "poisson",
     r_prior_alpha: float = 2.0,
     r_prior_beta: float = 2.0,
+    fixed_r: float | None = None,
     scale_prior_sigma: float = 0.5,
     encoder_version: str = "simple",
     metagene_reg_type: str = "correlation",
@@ -725,8 +787,13 @@ def nmf(
     sparse : bool, default=True
         If True, use sparse CSR batches (memory efficient, allows larger batches).
         If False, use dense batches (may be faster for smaller matrices).
-    likelihood : str, default="nb"
-        Likelihood function to use for the NMF model. Either "nb" or "poisson".
+    likelihood : str, default="poisson"
+        Likelihood function to use for the NMF model. Either "poisson" or "nb".
+        Poisson is the default: with a strict low-rank mean, learned NB dispersion
+        tends to absorb structured variation that the representation should
+        capture instead, and Poisson is also faster. NB remains available, and
+        pairs best with a fixed, reasonably-sized dispersion (see fixed_r), which
+        in practice behaves very similarly to Poisson.
     r_prior_alpha : float, default=2.0
         Shape parameter (alpha) for the Gamma prior on dispersion parameters r.
         For Gamma(alpha, beta), the mean is alpha/beta and mode is (alpha-1)/beta.
@@ -735,6 +802,16 @@ def nmf(
         Rate parameter (beta) for the Gamma prior on dispersion parameters r.
         For Gamma(alpha, beta), the mean is alpha/beta and mode is (alpha-1)/beta.
         Larger values push the prior towards smaller r values.
+    fixed_r : float or None, default=None
+        If given (and likelihood="nb"), the per-gene dispersion r is held fixed at
+        this constant value for every gene rather than being learned. The Gamma
+        prior (r_prior_alpha/r_prior_beta) is then ignored. This provides uniform,
+        non-adaptive overdispersion "slack": the model gets some tolerance for the
+        gap between the low-rank mean and the true rate, but cannot lower r to
+        explain away structured residuals that the representation should capture.
+        Smaller values mean more overdispersion (variance = mu + mu^2/r); as
+        fixed_r grows large the NB likelihood approaches Poisson. Has no effect
+        when likelihood="poisson" (r is unused there).
     scale_prior_sigma : float, default=0.5
         Standard deviation for the Normal(0, sigma) prior on log scale values.
         Cell-specific scale factors are learned by the encoder using exp transformation.
@@ -842,6 +919,7 @@ def nmf(
         hidden_dim,
         r_prior_alpha=r_prior_alpha,
         r_prior_beta=r_prior_beta,
+        fixed_r=fixed_r,
         scale_prior_sigma=scale_prior_sigma,
         encoder_version=encoder_version,
         metagene_reg_type=metagene_reg_type,
@@ -1016,7 +1094,9 @@ def nmf(
             ).item()
 
             Xnmf[start_idx:end_idx, :] = encoded_chunk.cpu().numpy()
-            scales[start_idx:end_idx] = torch.exp(log_scale_chunk).squeeze(1).cpu().numpy()
+            scales[start_idx:end_idx] = (
+                torch.exp(log_scale_chunk).squeeze(1).cpu().numpy()
+            )
 
     adata.obsm["X_nmf"] = Xnmf
     adata.obs["scale_nmf"] = scales
