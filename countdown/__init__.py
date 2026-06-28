@@ -262,6 +262,34 @@ class BoundedAuxiliaryEncoder(nn.Module):
         return F.softplus(u_direct + u_aux)
 
 
+class MultiplicativeGateEncoder(nn.Module):
+    """
+    Multiplicative-gate encoder: U = softplus(X@W_lin) * sigmoid(X@W_gate)
+
+    Architecture:
+    - Linear path produces magnitudes (as in SimpleEncoder).
+    - Gate path produces values in (0, 1) that multiplicatively dampen per cell
+      and per metagene, allowing selective suppression without ever forcing a
+      metagene fully dead (sigmoid is bounded away from 0, unlike relu gates).
+
+    When NNDSVD init is used the gate is saturated to 1 at construction
+    (zero weight, +10 bias → sigmoid(10) ≈ 1), so the encoder starts identical
+    to the linear-path NNDSVD init; training then learns subunitary gating.
+
+    Best for: more expressive than simple while resisting metagene collapse.
+    """
+
+    def __init__(self, n: int, k: int, hidden_dim: int):  # noqa: ARG002
+        super().__init__()
+        self.lin = SparseLinear(n, k)
+        self.gate = SparseLinear(n, k)
+        nn.init.normal_(self.gate.weight, 0.0, 1e-2)
+        nn.init.zeros_(self.gate.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.softplus(self.lin(x)) * torch.sigmoid(self.gate(x))
+
+
 class ScaleEncoder(nn.Module):
     """
     Simple MLP encoder for predicting cell-specific scale factors.
@@ -305,6 +333,7 @@ class NMF(nn.Module):
         gene_scale_factors: bool = False,
         init_method: str = "normal",
         v_init: np.ndarray | None = None,
+        encoder_init: tuple[np.ndarray, np.ndarray] | None = None,
     ):
         super().__init__()
 
@@ -316,10 +345,20 @@ class NMF(nn.Module):
             self.encoder = DeepCompactEncoder(n, k, hidden_dim)
         elif encoder_version == "bounded_auxiliary":
             self.encoder = BoundedAuxiliaryEncoder(n, k, hidden_dim)
+        elif encoder_version == "multiplicative_gate":
+            self.encoder = MultiplicativeGateEncoder(n, k, hidden_dim)
         else:
             raise ValueError(
                 f"Unknown encoder_version: {encoder_version}. "
-                f"Must be one of: 'simple', 'deep_softplus', 'deep_compact', 'bounded_auxiliary'"
+                f"Must be one of: 'simple', 'deep_softplus', 'deep_compact', "
+                f"'bounded_auxiliary', 'multiplicative_gate'"
+            )
+
+        if encoder_init is not None:
+            W_init, b_init = encoder_init
+            self._apply_encoder_init(
+                torch.tensor(W_init, dtype=torch.float32),
+                torch.tensor(b_init, dtype=torch.float32),
             )
 
         if v_init is not None:
@@ -370,6 +409,33 @@ class NMF(nn.Module):
         self.metagene_reg_strength = metagene_reg_strength
         self.gene_scale_factors = gene_scale_factors
 
+    def _apply_encoder_init(self, W_init: torch.Tensor, b_init: torch.Tensor) -> None:
+        """Initialize the encoder's primary linear path from NNDSVD factors.
+
+        Sets the primary SparseLinear layer so X @ W + b ≈ softplus^{-1}(U_target)
+        at construction, starting training near the amortized MAP. For encoders
+        with secondary paths (bounded_auxiliary's aux, multiplicative_gate's gate)
+        the secondary path is put in a transparent state so the encoder starts
+        equivalent to the linear-path-only init.
+        """
+        enc = self.encoder
+        if isinstance(enc, SimpleEncoder):
+            lin = enc.layer
+        elif isinstance(enc, BoundedAuxiliaryEncoder):
+            lin = enc.direct
+        elif isinstance(enc, MultiplicativeGateEncoder):
+            lin = enc.lin
+            with torch.no_grad():
+                enc.gate.weight.zero_()
+                enc.gate.bias.fill_(10.0)  # sigmoid(10) ≈ 1 — transparent at init
+        elif isinstance(enc, DeepCompactEncoder):
+            lin = enc.layer1
+        else:
+            return  # deep_softplus: two softplus layers, skip
+        with torch.no_grad():
+            lin.weight.copy_(W_init)
+            lin.bias.copy_(b_init.squeeze())
+
     # X: [batch_size, n]
     def forward(
         self, X: torch.Tensor
@@ -413,6 +479,14 @@ class NMF(nn.Module):
             k = enc.direct.weight.shape[1]
             h = torch.sparse.mm(X, fused_w) + fused_b
             u = F.softplus(h[:, :k] + torch.tanh(h[:, k : 2 * k]))
+            log_scale = self.scale_encoder.layer2(F.softplus(h[:, 2 * k :]))
+
+        elif isinstance(enc, MultiplicativeGateEncoder):
+            fused_w = torch.cat([enc.lin.weight, enc.gate.weight, s1.weight], dim=1)
+            fused_b = torch.cat([enc.lin.bias, enc.gate.bias, s1.bias])
+            k = enc.lin.weight.shape[1]
+            h = torch.sparse.mm(X, fused_w) + fused_b
+            u = F.softplus(h[:, :k]) * torch.sigmoid(h[:, k : 2 * k])
             log_scale = self.scale_encoder.layer2(F.softplus(h[:, 2 * k :]))
 
         elif isinstance(enc, (DeepSoftplusEncoder, DeepCompactEncoder)):
@@ -568,13 +642,13 @@ class NMF(nn.Module):
         Args:
             u: [batch_size, k] metagene usage for current batch
             log_scale: [batch_size, 1] log scale values for current batch
-            r_weight: Scaling for the per-gene dispersion (r) prior term. The r
-                prior is a single per-gene term independent of the cells in the
-                batch, so under per-batch SGD it must be weighted by 1/n_batches
-                to be applied exactly once per epoch (otherwise the effective
-                prior strength scales with the number of minibatches). The
-                cell-specific scale prior and the metagene regularizer are
-                already cell/batch-local and are NOT scaled.
+            r_weight: Scaling applied to all per-dataset prior terms. The r
+                prior and the metagene regularizer are both dataset-level
+                quantities (independent of which cells are in the current batch),
+                so under per-batch SGD they must be weighted by 1/n_batches to
+                accumulate to exactly one application per epoch. The cell-specific
+                scale prior sums over the batch and naturally accumulates correctly
+                without scaling.
 
         Returns negative log prior (to be minimized).
         """
@@ -602,7 +676,7 @@ class NMF(nn.Module):
         )
         neg_log_prior = neg_log_prior - log_prior_scale.sum()
 
-        neg_log_prior = neg_log_prior + self.metagene_regularization(u)
+        neg_log_prior = neg_log_prior + self.metagene_regularization(u) * r_weight
 
         return neg_log_prior
 
@@ -738,7 +812,7 @@ def nmf(
     fixed_r: float | None = None,
     scale_prior_sigma: float = 0.5,
     encoder_version: str = "simple",
-    metagene_reg_type: str = "correlation",
+    metagene_reg_type: str = "none",
     metagene_reg_strength: float = 0.01,
     gene_scale_factors: bool = True,
     init_method: str = "nndsvd",
@@ -889,7 +963,8 @@ def nmf(
         U = U[:, idx]
         Vt = Vt[idx, :]
 
-        H = np.zeros((k, n))
+        H = np.zeros((k, n))       # gene factor  [k, n]
+        U_nmf = np.zeros((X_init.shape[0], k))  # cell factor [m_sub, k]
         for j in range(k):
             x = U[:, j]
             y = Vt[j, :]
@@ -904,14 +979,35 @@ def nmf(
             mp = xpn * ypn
             mn = xnn * ynn
             if mp > mn:
-                v = yp * xpn * np.sqrt(S[j])
+                H[j, :] = yp * xpn * np.sqrt(S[j])
+                U_nmf[:, j] = xp * ypn * np.sqrt(S[j])
             else:
-                v = yn * xnn * np.sqrt(S[j])
-            H[j, :] = v
+                H[j, :] = yn * xnn * np.sqrt(S[j])
+                U_nmf[:, j] = xn * ynn * np.sqrt(S[j])
 
         H = H + 1e-6
         H_norm = H / H.sum(axis=1, keepdims=True)
         v_init = np.log(H_norm).astype(np.float32)
+
+        # Ridge-regress the encoder's primary linear path to predict U_nmf from
+        # X: minimize ||softplus^{-1}(U_nmf) - (X_sub @ W + b)||^2 + λ||W||^2.
+        # U_nmf has many near-zero entries whose softplus^{-1} is -∞, so clip
+        # at a small positive floor before inverting.
+        X_sub_dense = as_dense_f32(X_init)
+        target_pre = np.log(np.expm1(np.maximum(U_nmf.astype(np.float32), 1e-3)))
+        lam = 1.0
+        Xa = np.concatenate(
+            [X_sub_dense, np.ones((X_sub_dense.shape[0], 1), dtype=np.float32)], axis=1
+        )
+        gram = Xa.T @ Xa + lam * np.eye(n + 1, dtype=np.float32)
+        gram[-1, -1] = X_sub_dense.shape[0]  # don't regularize the bias
+        sol = np.linalg.solve(gram, Xa.T @ target_pre)  # [n+1, k]
+        encoder_init: tuple[np.ndarray, np.ndarray] | None = (
+            sol[:-1, :].astype(np.float32),
+            sol[-1, :].astype(np.float32),
+        )
+    else:
+        encoder_init = None
 
     model = NMF(
         n,
@@ -927,6 +1023,7 @@ def nmf(
         gene_scale_factors=gene_scale_factors,
         init_method=init_method,
         v_init=v_init,
+        encoder_init=encoder_init,
     ).to(device)
 
     if optimizer_name == "adam":
