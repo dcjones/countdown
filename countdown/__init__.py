@@ -621,6 +621,30 @@ class NMF(nn.Module):
                 corr_penalty + 1_000_000.0 * entropy_penalty
             )
 
+        elif self.metagene_reg_type == "min_volume":
+            # Log-determinant min-volume penalty: add logdet(V @ V^T + δI) to the
+            # loss. The data-fit term resists collapse; the equilibrium lands
+            # metagene vertices at the true data archetypes (sufficiently scattered
+            # condition). δ stabilizes the Cholesky when eigenvalues approach 0.
+            delta = 1e-6
+            gram = v_norm @ v_norm.T  # [k, k]
+            k = gram.shape[0]
+            sign, logdet = torch.linalg.slogdet(gram + delta * torch.eye(k, device=v_norm.device))
+            penalty = logdet  # positive when simplex is large; minimizing shrinks it
+            return self.metagene_reg_strength * penalty
+
+        elif self.metagene_reg_type == "min_volume_centered":
+            # Min-volume on background-subtracted V. Subtracting the per-gene mean
+            # across metagenes removes the housekeeping-gene inflation that corrupts
+            # the Gram matrix when softmax gives every gene nonzero mass.
+            delta = 1e-6
+            v_bg = v_norm - v_norm.mean(dim=0, keepdim=True)  # [k, n]
+            gram = v_bg @ v_bg.T  # [k, k]
+            k = gram.shape[0]
+            sign, logdet = torch.linalg.slogdet(gram + delta * torch.eye(k, device=v_norm.device))
+            penalty = logdet
+            return self.metagene_reg_strength * penalty
+
         else:
             return torch.zeros(1, device=self.v.device).squeeze()
 
